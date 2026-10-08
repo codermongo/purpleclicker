@@ -338,6 +338,7 @@ namespace PurpleClicker
         string title = "", sub = "";
         int phase; // 0 = einblenden, 1 = halten, 2 = ausblenden
         int holdUntil;
+        int holdMs = 5000;
 
         public OverlayForm(Bitmap logo, float scale)
         {
@@ -391,9 +392,10 @@ namespace PurpleClicker
             }
         }
 
-        public void ShowMessage(string t, string s, Screen screen)
+        public void ShowMessage(string t, string s, Screen screen, int seconds)
         {
             title = t;
+            holdMs = Math.Max(1, seconds) * 1000;
             sub = s;
             Rectangle b = screen.Bounds;
             int margin = (int)Math.Round(20 * scale);
@@ -412,7 +414,7 @@ namespace PurpleClicker
             if (phase == 0)
             {
                 Opacity = Math.Min(0.96, Opacity + 0.10);
-                if (Opacity >= 0.96) { phase = 1; holdUntil = Environment.TickCount + 5000; }
+                if (Opacity >= 0.96) { phase = 1; holdUntil = Environment.TickCount + holdMs; }
             }
             else if (phase == 1)
             {
@@ -484,7 +486,7 @@ namespace PurpleClicker
     {
         None, Close, Min, Drag, Minus, Plus, Number, Slider,
         BtnLeft, BtnRight, ClkSingle, ClkDouble, HotChange, Start,
-        AutoSw, FilterSw, MulSlider, MulSw, ChipX, ChipAdd, PopItem, PopPanel, PopOutside
+        AutoSw, FilterSw, MulSlider, MulSw, DurSlider, ChipX, ChipAdd, PopItem, PopPanel, PopOutside
     }
 
     // ------------------------------------------------------------------ Fenster
@@ -518,10 +520,13 @@ namespace PurpleClicker
         static readonly Rectangle R_CardSys = new Rectangle(366, 194, 314, 56);
         static readonly Rectangle R_AutoSw = new Rectangle(620, 210, 44, 24);
 
-        static readonly Rectangle R_CardMul = new Rectangle(20, 262, 660, 56);
-        static readonly Rectangle R_MulSlider = new Rectangle(186, 268, 350, 44);
-        const int MUL_X = 204, MUL_W = 316, MUL_Y = 290;
-        static readonly Rectangle R_MulSw = new Rectangle(620, 278, 44, 24);
+        static readonly Rectangle R_CardMul = new Rectangle(20, 262, 380, 56);
+        static readonly Rectangle R_MulSlider = new Rectangle(146, 268, 150, 44);
+        const int MUL_X = 156, MUL_W = 130, MUL_Y = 290;
+        static readonly Rectangle R_CardDur = new Rectangle(416, 262, 264, 56);
+        static readonly Rectangle R_DurSlider = new Rectangle(498, 268, 128, 44);
+        const int DUR_X = 508, DUR_W = 108;
+        static readonly Rectangle R_MulSw = new Rectangle(340, 278, 44, 24);
 
         static readonly Rectangle R_CardProg = new Rectangle(20, 330, 660, 108);
         static readonly Rectangle R_FilterSw = new Rectangle(620, 338, 44, 24);
@@ -573,7 +578,8 @@ namespace PurpleClicker
         int intervalMs = 100;
         bool editing;
         string editBuf = "";
-        int dragKind;              // 0 = nichts, 1 = Intervall-Slider, 2 = Multiplikator-Slider
+        int dragKind;              // 0 = nichts, 1 = Intervall-Slider, 2 = Multiplikator-Slider, 3 = Meldungsdauer
+        int overlaySec = 5;        // Anzeigedauer des Overlays (1-10 s)
         bool multiOn;
         int multiplier = 5;
         Hit hover = Hit.None;
@@ -899,13 +905,24 @@ namespace PurpleClicker
             }
         }
 
+        // Vorschau beim Loslassen des Dauer-Schiebers
+        void ShowPreview()
+        {
+            try
+            {
+                if (overlay == null || overlay.IsDisposed) overlay = new OverlayForm(logo, scale);
+                overlay.ShowMessage("Purple Clicker aktiv", "Vorschau · " + overlaySec + " s", Screen.FromHandle(Handle), overlaySec);
+            }
+            catch { }
+        }
+
         // Kleines Overlay oben rechts (ohne Ton, klickdurchlaessig, nimmt keinen Fokus)
         void ShowOverlay(string exe, IntPtr fg)
         {
             try
             {
                 if (overlay == null || overlay.IsDisposed) overlay = new OverlayForm(logo, scale);
-                overlay.ShowMessage("Purple Clicker aktiv", exe + " erkannt", Screen.FromHandle(fg));
+                overlay.ShowMessage("Purple Clicker aktiv", exe + " erkannt", Screen.FromHandle(fg), overlaySec);
             }
             catch { }
         }
@@ -1041,6 +1058,7 @@ namespace PurpleClicker
             if (R_Slider.Contains(p)) return Hit.Slider;
             if (R_MulSw.Contains(p)) return Hit.MulSw;
             if (R_MulSlider.Contains(p)) return Hit.MulSlider;
+            if (R_DurSlider.Contains(p)) return Hit.DurSlider;
             if (R_BtnL.Contains(p)) return Hit.BtnLeft;
             if (R_BtnR.Contains(p)) return Hit.BtnRight;
             if (R_ClkS.Contains(p)) return Hit.ClkSingle;
@@ -1060,6 +1078,15 @@ namespace PurpleClicker
             if (addRect.Contains(p) && programs.Count < MAX_PROGRAMS) return Hit.ChipAdd;
             if (R_Start.Contains(p)) return Hit.Start;
             return Hit.None;
+        }
+
+        void DurTo(int x)
+        {
+            double t = (x - DUR_X) / (double)DUR_W;
+            if (t < 0) t = 0;
+            if (t > 1) t = 1;
+            overlaySec = 1 + (int)Math.Round(t * 9);
+            Invalidate();
         }
 
         void MulTo(int x)
@@ -1121,6 +1148,10 @@ namespace PurpleClicker
                 case Hit.HotChange: capturing = !capturing; break;
                 case Hit.Start: Toggle(); break;
                 case Hit.MulSw: multiOn = !multiOn; break;
+                case Hit.DurSlider:
+                    dragKind = 3;
+                    DurTo(p.X);
+                    break;
                 case Hit.MulSlider:
                     dragKind = 2;
                     MulTo(p.X);
@@ -1166,6 +1197,7 @@ namespace PurpleClicker
             Point p = Logical(e.Location);
             if (dragKind == 1) SliderTo(p.X);
             else if (dragKind == 2) MulTo(p.X);
+            else if (dragKind == 3) DurTo(p.X);
             Hit h = HitTest(p);
             int idx = hitIndex;
             if (h != hover || idx != hoverIdx)
@@ -1181,8 +1213,10 @@ namespace PurpleClicker
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);
+            bool wasDur = dragKind == 3;
             dragKind = 0;
             repeatTimer.Stop();
+            if (wasDur) ShowPreview(); // Vorschau mit der eingestellten Dauer
         }
 
         protected override void OnMouseLeave(EventArgs e)
@@ -1501,8 +1535,25 @@ namespace PurpleClicker
                 using (SolidBrush b = new SolidBrush(Color.FromArgb(i < multiplier ? 90 : 50, 150, 150, 150)))
                     g.FillEllipse(b, tx2 - 1, MUL_Y + 12, 3, 3);
             }
-            DrawText(g, multiplier + "×", fBtn, multiOn ? C_Accent : C_Dim, new Rectangle(R_CardMul.X + 508, R_CardMul.Y, 70, R_CardMul.Height), StringAlignment.Center);
+            DrawText(g, multiplier + "×", fBtn, multiOn ? C_Accent : C_Dim, new Rectangle(R_CardMul.X + 276, R_CardMul.Y, 44, R_CardMul.Height), StringAlignment.Center);
             Switch(g, R_MulSw, multiOn, hover == Hit.MulSw);
+
+            // Dauer der Overlay-Meldung (1-10 s)
+            CardInline(g, R_CardDur, "MELDUNG");
+            int dx = DUR_X + (int)Math.Round((overlaySec - 1) / 9.0 * DUR_W);
+            FillRR(g, Color.FromArgb(34, 34, 34), new Rectangle(DUR_X, MUL_Y - 3, DUR_W, 6), 3);
+            FillRR(g, C_Accent, new Rectangle(DUR_X, MUL_Y - 3, Math.Max(dx - DUR_X, 6), 6), 3);
+            using (SolidBrush b = new SolidBrush(Color.White))
+                g.FillEllipse(b, dx - 8, MUL_Y - 8, 16, 16);
+            using (Pen pen = new Pen(C_Accent, 2f))
+                g.DrawEllipse(pen, dx - 8, MUL_Y - 8, 16, 16);
+            for (int i = 0; i < 10; i++)
+            {
+                int tx3 = DUR_X + (int)Math.Round(i / 9.0 * DUR_W);
+                using (SolidBrush b = new SolidBrush(Color.FromArgb(i < overlaySec ? 90 : 50, 150, 150, 150)))
+                    g.FillEllipse(b, tx3 - 1, MUL_Y + 12, 3, 3);
+            }
+            DrawText(g, overlaySec + " s", fBtn, C_Accent, new Rectangle(R_CardDur.X + 204, R_CardDur.Y, 44, R_CardDur.Height), StringAlignment.Center);
 
             // Nur in Programmen
             Card(g, R_CardProg, "NUR IN PROGRAMMEN");
@@ -1560,6 +1611,7 @@ namespace PurpleClicker
                         case "FilterOn": filterOn = v != 0; break;
                         case "MultiOn": multiOn = v != 0; break;
                         case "Multi": multiplier = Math.Min(Math.Max(v, 1), 10); break;
+                        case "OverlaySec": overlaySec = Math.Min(Math.Max(v, 1), 10); break;
                         case "Programs":
                             programs.Clear();
                             foreach (string s in raw.Split(';'))
@@ -1588,6 +1640,7 @@ namespace PurpleClicker
                     "FilterOn=" + (filterOn ? 1 : 0),
                     "MultiOn=" + (multiOn ? 1 : 0),
                     "Multi=" + multiplier,
+                    "OverlaySec=" + overlaySec,
                     "Programs=" + string.Join(";", programs.ToArray())
                 });
             }
