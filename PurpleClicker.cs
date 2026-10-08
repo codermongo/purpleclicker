@@ -90,6 +90,8 @@ namespace PurpleClicker
         public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out int value, int size);
 
         [DllImport("user32.dll")]
+        public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+        [DllImport("user32.dll")]
         public static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
         [DllImport("user32.dll")]
         public static extern bool IsWindowVisible(IntPtr hWnd);
@@ -320,6 +322,149 @@ namespace PurpleClicker
         public override Color SeparatorLight { get { return Line; } }
     }
 
+    // Kleine Einblendung oben rechts: ohne Ton, klickdurchlaessig, nimmt dem Spiel keinen Fokus
+    class OverlayForm : Form
+    {
+        const int W = 300, H = 64;
+        static readonly Color Bg = Color.FromArgb(14, 14, 14);
+        static readonly Color Accent = Color.FromArgb(124, 108, 255);
+
+        readonly float scale;
+        readonly Bitmap logo;
+        readonly Font fTitle = new Font("Segoe UI Semibold", 10.5f);
+        readonly Font fSub = new Font("Segoe UI", 9f);
+        readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
+        string title = "", sub = "";
+        int phase; // 0 = einblenden, 1 = halten, 2 = ausblenden
+        int holdUntil;
+
+        public OverlayForm(Bitmap logo, float scale)
+        {
+            this.logo = logo;
+            this.scale = scale;
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.Manual;
+            TopMost = true;
+            BackColor = Bg;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true);
+            Size = new Size((int)Math.Round(W * scale), (int)Math.Round(H * scale));
+            Opacity = 0;
+            timer.Interval = 16;
+            timer.Tick += Tick;
+        }
+
+        protected override bool ShowWithoutActivation { get { return true; } }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                // TOPMOST | TRANSPARENT (klickdurchlaessig) | TOOLWINDOW (nicht in Alt-Tab) | LAYERED | NOACTIVATE
+                cp.ExStyle |= 0x8 | 0x20 | 0x80 | 0x80000 | 0x08000000;
+                return cp;
+            }
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            int pref = 2; // DWMWCP_ROUND
+            if (Native.DwmSetWindowAttribute(Handle, 33, ref pref, 4) == 0)
+            {
+                int border = 0xFF6C7C; // Akzentfarbe als Rand (COLORREF = BGR)
+                Native.DwmSetWindowAttribute(Handle, 34, ref border, 4);
+            }
+            else
+            {
+                GraphicsPath p = new GraphicsPath();
+                float d = 20f * scale;
+                p.AddArc(0, 0, d, d, 180, 90);
+                p.AddArc(Width - d, 0, d, d, 270, 90);
+                p.AddArc(Width - d, Height - d, d, d, 0, 90);
+                p.AddArc(0, Height - d, d, d, 90, 90);
+                p.CloseFigure();
+                Region = new Region(p);
+            }
+        }
+
+        public void ShowMessage(string t, string s, Screen screen)
+        {
+            title = t;
+            sub = s;
+            Rectangle b = screen.Bounds;
+            int margin = (int)Math.Round(20 * scale);
+            Location = new Point(b.Right - Width - margin, b.Top + margin);
+            Opacity = 0;
+            phase = 0;
+            if (!Visible) Show();
+            // ganz nach oben, ohne zu aktivieren (0x1 NOSIZE | 0x2 NOMOVE | 0x10 NOACTIVATE | 0x40 SHOWWINDOW)
+            Native.SetWindowPos(Handle, (IntPtr)(-1), 0, 0, 0, 0, 0x1 | 0x2 | 0x10 | 0x40);
+            Invalidate();
+            timer.Start();
+        }
+
+        void Tick(object sender, EventArgs e)
+        {
+            if (phase == 0)
+            {
+                Opacity = Math.Min(0.96, Opacity + 0.10);
+                if (Opacity >= 0.96) { phase = 1; holdUntil = Environment.TickCount + 3000; }
+            }
+            else if (phase == 1)
+            {
+                if (Environment.TickCount - holdUntil >= 0) phase = 2;
+            }
+            else
+            {
+                Opacity = Math.Max(0, Opacity - 0.07);
+                if (Opacity <= 0)
+                {
+                    timer.Stop();
+                    Hide();
+                }
+            }
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.Clear(Bg);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+            g.ScaleTransform(scale, scale);
+            if (logo != null)
+            {
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.DrawImage(logo, new Rectangle(16, 16, 32, 32));
+            }
+            using (StringFormat sf = new StringFormat())
+            {
+                sf.LineAlignment = StringAlignment.Center;
+                sf.Trimming = StringTrimming.EllipsisCharacter;
+                sf.FormatFlags = StringFormatFlags.NoWrap;
+                using (SolidBrush b = new SolidBrush(Color.FromArgb(237, 237, 237)))
+                    g.DrawString(title, fTitle, b, new Rectangle(60, 9, W - 72, 24), sf);
+                using (SolidBrush b = new SolidBrush(Color.FromArgb(140, 140, 140)))
+                    g.DrawString(sub, fSub, b, new Rectangle(60, 32, W - 72, 22), sf);
+            }
+        }
+
+        // Nur zum Testen des Designs
+        public void Snapshot(string path)
+        {
+            IntPtr h = Handle;
+            title = "Purple Clicker aktiv";
+            sub = "game.exe erkannt";
+            using (Bitmap bmp = new Bitmap(ClientSize.Width, ClientSize.Height))
+            {
+                DrawToBitmap(bmp, new Rectangle(0, 0, bmp.Width, bmp.Height));
+                bmp.Save(path, ImageFormat.Png);
+            }
+        }
+    }
+
     enum Hit
     {
         None, Close, Min, Drag, Minus, Plus, Number, Slider,
@@ -426,7 +571,9 @@ namespace PurpleClicker
         bool filterOn;
         readonly List<string> programs = new List<string>();
         bool active = true;        // Hotkey darf reagieren
-        bool wasMatch;
+        readonly HashSet<uint> announced = new HashSet<uint>(); // Prozesse, fuer die die Meldung schon kam
+        int pruneTick;
+        OverlayForm overlay;
         bool autostart;
         bool popupOpen;
         int popScroll;
@@ -725,9 +872,18 @@ namespace PurpleClicker
 
             bool newActive = !filterOn || own || match;
 
-            if (filterOn && match && !wasMatch)
-                Notify(exe + " erkannt – Purple Clicker ist aktiv");
-            wasMatch = match;
+            // Meldung nur einmal pro gestartetem Programm (nicht bei jedem Tab-Wechsel)
+            if (filterOn && match && announced.Add(pid))
+                ShowOverlay(exe, fg);
+            if (++pruneTick >= 40) // ca. alle 10 s: beendete Prozesse vergessen, damit ein Neustart wieder meldet
+            {
+                pruneTick = 0;
+                announced.RemoveWhere(delegate(uint ap)
+                {
+                    try { Process.GetProcessById((int)ap); return false; }
+                    catch { return true; }
+                });
+            }
 
             if (newActive != active)
             {
@@ -737,10 +893,15 @@ namespace PurpleClicker
             }
         }
 
-        void Notify(string text)
+        // Kleines Overlay oben rechts (ohne Ton, klickdurchlaessig, nimmt keinen Fokus)
+        void ShowOverlay(string exe, IntPtr fg)
         {
-            if (notify == null) return;
-            notify.ShowBalloonTip(3000, "Purple Clicker", text, ToolTipIcon.None);
+            try
+            {
+                if (overlay == null || overlay.IsDisposed) overlay = new OverlayForm(logo, scale);
+                overlay.ShowMessage("Purple Clicker aktiv", exe + " erkannt", Screen.FromHandle(fg));
+            }
+            catch { }
         }
 
         // Laufende Programme mit sichtbarem Fenster
@@ -968,7 +1129,7 @@ namespace PurpleClicker
                     break;
                 case Hit.ChipX:
                     if (idx >= 0 && idx < programs.Count) programs.RemoveAt(idx);
-                    wasMatch = false;
+                    announced.Clear();
                     ForegroundTick();
                     break;
                 case Hit.ChipAdd:
@@ -981,7 +1142,7 @@ namespace PurpleClicker
                     {
                         programs.Add(popItems[idx].Exe);
                         filterOn = true; // Auswahl aktiviert den Filter
-                        wasMatch = false;
+                        announced.Clear();
                         popupOpen = false;
                         ForegroundTick();
                     }
@@ -1474,6 +1635,18 @@ namespace PurpleClicker
             string snapPath = null;
             for (int i = 0; i < args.Length; i++)
             {
+                if (args[i] == "--overlay-snapshot" && i + 1 < args.Length)
+                {
+                    Native.SetProcessDPIAware();
+                    Application.EnableVisualStyles();
+                    Application.SetCompatibleTextRenderingDefault(false);
+                    float sc;
+                    using (Graphics g0 = Graphics.FromHwnd(IntPtr.Zero)) sc = g0.DpiX / 96f;
+                    Bitmap lg = null;
+                    try { lg = Icon.ExtractAssociatedIcon(Application.ExecutablePath).ToBitmap(); } catch { }
+                    new OverlayForm(lg, sc).Snapshot(args[i + 1]);
+                    return;
+                }
                 if (args[i] == "--tray") tray = true;
                 else if (args[i] == "--snapshot" && i + 1 < args.Length) { snapshot = true; snapPath = args[++i]; }
                 else if (args[i] == "--demo") demo = true;
