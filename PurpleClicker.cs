@@ -327,7 +327,8 @@ namespace PurpleClicker
     {
         const int W = 300, H = 64;
         static readonly Color Bg = Color.FromArgb(14, 14, 14);
-        static readonly Color Accent = Color.FromArgb(124, 108, 255);
+        static readonly Color Green = Color.FromArgb(52, 211, 100);
+        float cornerRadius = 10f; // logische Pixel; mit DWM-Rundung 8
 
         readonly float scale;
         readonly Bitmap logo;
@@ -373,7 +374,8 @@ namespace PurpleClicker
             int pref = 2; // DWMWCP_ROUND
             if (Native.DwmSetWindowAttribute(Handle, 33, ref pref, 4) == 0)
             {
-                int border = 0xFF6C7C; // Akzentfarbe als Rand (COLORREF = BGR)
+                int border = 0x64D334; // Gruen (COLORREF = BGR)
+                cornerRadius = 8f;
                 Native.DwmSetWindowAttribute(Handle, 34, ref border, 4);
             }
             else
@@ -410,7 +412,7 @@ namespace PurpleClicker
             if (phase == 0)
             {
                 Opacity = Math.Min(0.96, Opacity + 0.10);
-                if (Opacity >= 0.96) { phase = 1; holdUntil = Environment.TickCount + 3000; }
+                if (Opacity >= 0.96) { phase = 1; holdUntil = Environment.TickCount + 5000; }
             }
             else if (phase == 1)
             {
@@ -434,6 +436,19 @@ namespace PurpleClicker
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
             g.ScaleTransform(scale, scale);
+            // gruener Rahmen = "Programm erkannt"
+            RectangleF rf = new RectangleF(1.25f, 1.25f, W - 2.5f, H - 2.5f);
+            float d = cornerRadius * 2;
+            using (GraphicsPath bp = new GraphicsPath())
+            using (Pen bpen = new Pen(Green, 2.5f))
+            {
+                bp.AddArc(rf.X, rf.Y, d, d, 180, 90);
+                bp.AddArc(rf.Right - d, rf.Y, d, d, 270, 90);
+                bp.AddArc(rf.Right - d, rf.Bottom - d, d, d, 0, 90);
+                bp.AddArc(rf.X, rf.Bottom - d, d, d, 90, 90);
+                bp.CloseFigure();
+                g.DrawPath(bpen, bp);
+            }
             if (logo != null)
             {
                 g.InterpolationMode = InterpolationMode.HighQualityBicubic;
@@ -571,8 +586,7 @@ namespace PurpleClicker
         bool filterOn;
         readonly List<string> programs = new List<string>();
         bool active = true;        // Hotkey darf reagieren
-        readonly HashSet<uint> announced = new HashSet<uint>(); // Prozesse, fuer die die Meldung schon kam
-        int pruneTick;
+        bool wasMatch;             // gewaehltes Programm war beim letzten Check im Vordergrund
         OverlayForm overlay;
         bool autostart;
         bool popupOpen;
@@ -872,18 +886,10 @@ namespace PurpleClicker
 
             bool newActive = !filterOn || own || match;
 
-            // Meldung nur einmal pro gestartetem Programm (nicht bei jedem Tab-Wechsel)
-            if (filterOn && match && announced.Add(pid))
+            // Overlay jedes Mal, wenn ein gewaehltes Programm in den Vordergrund kommt
+            if (filterOn && match && !wasMatch)
                 ShowOverlay(exe, fg);
-            if (++pruneTick >= 40) // ca. alle 10 s: beendete Prozesse vergessen, damit ein Neustart wieder meldet
-            {
-                pruneTick = 0;
-                announced.RemoveWhere(delegate(uint ap)
-                {
-                    try { Process.GetProcessById((int)ap); return false; }
-                    catch { return true; }
-                });
-            }
+            wasMatch = match;
 
             if (newActive != active)
             {
@@ -1129,7 +1135,7 @@ namespace PurpleClicker
                     break;
                 case Hit.ChipX:
                     if (idx >= 0 && idx < programs.Count) programs.RemoveAt(idx);
-                    announced.Clear();
+                    wasMatch = false;
                     ForegroundTick();
                     break;
                 case Hit.ChipAdd:
@@ -1142,7 +1148,7 @@ namespace PurpleClicker
                     {
                         programs.Add(popItems[idx].Exe);
                         filterOn = true; // Auswahl aktiviert den Filter
-                        announced.Clear();
+                        wasMatch = false;
                         popupOpen = false;
                         ForegroundTick();
                     }
