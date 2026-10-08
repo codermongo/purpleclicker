@@ -94,6 +94,10 @@ namespace PurpleClicker
         [DllImport("user32.dll")]
         public static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
         [DllImport("user32.dll")]
+        public static extern IntPtr WindowFromPoint(POINT pt);
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
+        [DllImport("user32.dll")]
         public static extern bool IsWindowVisible(IntPtr hWnd);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern int GetWindowText(IntPtr hWnd, StringBuilder sb, int max);
@@ -806,6 +810,18 @@ namespace PurpleClicker
             return ((mouseData >> 16) & 0xFFFF) == 1 ? 4 : 5;
         }
 
+        // Liegt unter dem Klickpunkt wirklich unser Fenster? (nicht nur dessen Koordinaten:
+        // ein Spiel mit festgehaltener Maus klickt immer in der Fenstermitte, die unter unserem Fenster liegen kann)
+        bool IsOwnWindowAt(Point pt)
+        {
+            if (!IsHandleCreated || !Visible) return false;
+            Native.POINT p = new Native.POINT();
+            p.X = pt.X;
+            p.Y = pt.Y;
+            IntPtr h = Native.WindowFromPoint(p);
+            return h != IntPtr.Zero && Native.GetAncestor(h, 2) == Handle; // GA_ROOT
+        }
+
         bool HandleMouse(int btn, bool down, Point pt)
         {
             if (!down)
@@ -813,12 +829,12 @@ namespace PurpleClicker
                 if (swallowUp[btn]) { swallowUp[btn] = false; return true; }
                 // Multiplikator: echter Klick (Hook ignoriert eigene) -> N-1 zusaetzliche Klicks nach dem Loslassen
                 if (multiOn && multiplier > 1 && active && !capturing &&
-                    btn == (clicker.Right ? 2 : 1) && !(Visible && Bounds.Contains(pt)))
+                    btn == (clicker.Right ? 2 : 1) && !IsOwnWindowAt(pt))
                     clicker.Burst(multiplier - 1);
                 return false;
             }
             // Links/Rechts im eigenen sichtbaren Fenster nie abfangen, sonst waere die Bedienung blockiert
-            if (btn <= 2 && Visible && Bounds.Contains(pt)) return false;
+            if (btn <= 2 && IsOwnWindowAt(pt)) return false;
 
             if (capturing)
             {
