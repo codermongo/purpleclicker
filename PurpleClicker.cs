@@ -490,7 +490,7 @@ namespace PurpleClicker
     {
         None, Close, Min, Drag, Minus, Plus, Number, Slider,
         BtnLeft, BtnRight, ClkSingle, ClkDouble, HotChange, Start,
-        AutoSw, FilterSw, MulSlider, MulSw, DurSlider, ChipX, ChipAdd, PopItem, PopPanel, PopOutside,
+        AutoSw, FilterSw, MulSlider, MulSw, MulKey, DurSlider, ChipX, ChipAdd, PopItem, PopPanel, PopOutside,
         Gear, ThemeItem, ThemePanel, ThemeOutside
     }
 
@@ -528,13 +528,14 @@ namespace PurpleClicker
         static readonly Rectangle R_CardSys = new Rectangle(366, 194, 314, 56);
         static readonly Rectangle R_AutoSw = new Rectangle(620, 210, 44, 24);
 
-        static readonly Rectangle R_CardMul = new Rectangle(20, 262, 380, 56);
-        static readonly Rectangle R_MulSlider = new Rectangle(146, 268, 150, 44);
-        const int MUL_X = 156, MUL_W = 130, MUL_Y = 290;
-        static readonly Rectangle R_CardDur = new Rectangle(416, 262, 264, 56);
-        static readonly Rectangle R_DurSlider = new Rectangle(498, 268, 128, 44);
-        const int DUR_X = 508, DUR_W = 108;
-        static readonly Rectangle R_MulSw = new Rectangle(340, 278, 44, 24);
+        static readonly Rectangle R_CardMul = new Rectangle(20, 262, 420, 56);
+        static readonly Rectangle R_MulSlider = new Rectangle(140, 268, 116, 44);
+        const int MUL_X = 150, MUL_W = 96, MUL_Y = 290;
+        static readonly Rectangle R_MulKey = new Rectangle(298, 273, 66, 30);
+        static readonly Rectangle R_CardDur = new Rectangle(456, 262, 224, 56);
+        static readonly Rectangle R_DurSlider = new Rectangle(538, 268, 104, 44);
+        const int DUR_X = 548, DUR_W = 84;
+        static readonly Rectangle R_MulSw = new Rectangle(376, 278, 44, 24);
 
         static readonly Rectangle R_CardProg = new Rectangle(20, 330, 660, 108);
         static readonly Rectangle R_FilterSw = new Rectangle(620, 338, 44, 24);
@@ -730,7 +731,9 @@ namespace PurpleClicker
         IntPtr keyHook = IntPtr.Zero;
 
         Hotkey hotkey = new Hotkey(false, (int)Keys.F6);
+        Hotkey mulKey = new Hotkey(false, 0);   // Hotkey fuer den Multiplikator (Code 0 = keiner)
         bool capturing;
+        int capTarget;                          // 0 = Start/Stop-Hotkey, 1 = Multiplikator-Hotkey
         readonly bool[] swallowUp = new bool[6];
         readonly HashSet<int> swallowedKeys = new HashSet<int>();
 
@@ -997,7 +1000,7 @@ namespace PurpleClicker
 
             if (capturing)
             {
-                hotkey = new Hotkey(true, btn);
+                AssignKey(true, btn);
                 capturing = false;
                 swallowUp[btn] = true;
                 Invalidate();
@@ -1010,7 +1013,39 @@ namespace PurpleClicker
                 Toggle();
                 return true;
             }
+            if (mulKey.Code != 0 && mulKey.IsMouse && mulKey.Code == btn)
+            {
+                swallowUp[btn] = true;
+                ToggleMulti();
+                return true;
+            }
             return false;
+        }
+
+        // Belegt den gerade gewaehlten Hotkey (Start/Stop oder Multiplikator); keine Doppelbelegung
+        void AssignKey(bool isMouse, int code)
+        {
+            if (capTarget == 0)
+            {
+                hotkey = new Hotkey(isMouse, code);
+                if (mulKey.IsMouse == isMouse && mulKey.Code == code) mulKey = new Hotkey(false, 0);
+            }
+            else if (!(hotkey.IsMouse == isMouse && hotkey.Code == code))
+                mulKey = new Hotkey(isMouse, code);
+        }
+
+        void ToggleMulti()
+        {
+            multiOn = !multiOn;
+            Invalidate();
+            try
+            {
+                if (overlay == null || overlay.IsDisposed) overlay = new OverlayForm(logo, scale);
+                IntPtr fg = Native.GetForegroundWindow();
+                overlay.ShowMessage("Multiplikator " + (multiOn ? "an" : "aus"), multiplier + "× pro Klick",
+                    fg != IntPtr.Zero ? Screen.FromHandle(fg) : Screen.PrimaryScreen, 2);
+            }
+            catch { }
         }
 
         IntPtr KeyProc(int nCode, IntPtr wParam, IntPtr lParam)
@@ -1039,7 +1074,8 @@ namespace PurpleClicker
             {
                 capturing = false;
                 swallowedKeys.Add(vk);
-                if (vk != (int)Keys.Escape) hotkey = new Hotkey(false, vk);
+                if (vk != (int)Keys.Escape) AssignKey(false, vk);
+                else if (capTarget == 1) mulKey = new Hotkey(false, 0);   // Esc entfernt den Multiplikator-Hotkey
                 Invalidate();
                 return true;
             }
@@ -1047,6 +1083,11 @@ namespace PurpleClicker
             if (!hotkey.IsMouse && hotkey.Code == vk)
             {
                 if (swallowedKeys.Add(vk)) Toggle(); // Auto-Repeat nur schlucken
+                return true;
+            }
+            if (mulKey.Code != 0 && !mulKey.IsMouse && mulKey.Code == vk)
+            {
+                if (swallowedKeys.Add(vk)) ToggleMulti();
                 return true;
             }
             return false;
@@ -1243,6 +1284,7 @@ namespace PurpleClicker
             if (R_Num.Contains(p)) return Hit.Number;
             if (R_Slider.Contains(p)) return Hit.Slider;
             if (R_MulSw.Contains(p)) return Hit.MulSw;
+            if (R_MulKey.Contains(p)) return Hit.MulKey;
             if (R_MulSlider.Contains(p)) return Hit.MulSlider;
             if (R_DurSlider.Contains(p)) return Hit.DurSlider;
             if (R_BtnL.Contains(p)) return Hit.BtnLeft;
@@ -1300,7 +1342,7 @@ namespace PurpleClicker
             Hit h = HitTest(p);
             int idx = hitIndex;
 
-            if (capturing && h != Hit.HotChange) { capturing = false; Invalidate(); }
+            if (capturing && h != (capTarget == 0 ? Hit.HotChange : Hit.MulKey)) { capturing = false; Invalidate(); }
             if (editing && h != Hit.Number) CommitEdit();
 
             switch (h)
@@ -1345,7 +1387,8 @@ namespace PurpleClicker
                 case Hit.BtnRight: clicker.Right = true; break;
                 case Hit.ClkSingle: clicker.Double = false; break;
                 case Hit.ClkDouble: clicker.Double = true; break;
-                case Hit.HotChange: capturing = !capturing; break;
+                case Hit.HotChange: capTarget = 0; capturing = !capturing; break;
+                case Hit.MulKey: capTarget = 1; capturing = !capturing; break;
                 case Hit.Start: Toggle(); break;
                 case Hit.MulSw: multiOn = !multiOn; break;
                 case Hit.DurSlider:
@@ -1837,15 +1880,17 @@ namespace PurpleClicker
             // Hotkey
             CardInline(g, R_CardHot, "HOTKEY");
             FillRR(g, C_Field, R_HotPill, RadCtl(R_HotPill.Height));
-            StrokeRR(g, capturing ? C_Accent : C_CardLine, R_HotPill, RadCtl(R_HotPill.Height), capturing ? 1.5f : 1f);
-            if (capturing)
+            bool capMain = capturing && capTarget == 0;
+            bool capMul = capturing && capTarget == 1;
+            StrokeRR(g, capMain ? C_Accent : C_CardLine, R_HotPill, RadCtl(R_HotPill.Height), capMain ? 1.5f : 1f);
+            if (capMain)
                 DrawText(g, "Taste drücken…", fBtn, C_Accent,
                     new Rectangle(R_HotPill.X + 16, R_HotPill.Y, 128, R_HotPill.Height), StringAlignment.Near);
             else
                 DrawText(g, hotkey.Name(), fBtn, C_Text,
                     new Rectangle(R_HotPill.X + 16, R_HotPill.Y, 128, R_HotPill.Height), StringAlignment.Near);
             FillRR(g, hover == Hit.HotChange ? C_BtnHover : C_Btn, R_HotBtn, RadCtl(R_HotBtn.Height));
-            DrawText(g, capturing ? "Abbruch" : "Ändern", fBtn, C_Text, R_HotBtn, StringAlignment.Center);
+            DrawText(g, capMain ? "Abbruch" : "Ändern", fBtn, C_Text, R_HotBtn, StringAlignment.Center);
 
             // System: Autostart
             CardInline(g, R_CardSys, "AUTOSTART");
@@ -1867,7 +1912,13 @@ namespace PurpleClicker
                 using (SolidBrush b = new SolidBrush(Color.FromArgb(i < multiplier ? 90 : 50, 150, 150, 150)))
                     g.FillEllipse(b, tx2 - 1, MUL_Y + 12, 3, 3);
             }
-            DrawText(g, multiplier + "×", fBtn, multiOn ? C_Accent : C_Dim, new Rectangle(R_CardMul.X + 276, R_CardMul.Y, 44, R_CardMul.Height), StringAlignment.Center);
+            DrawText(g, multiplier + "×", fBtn, multiOn ? C_Accent : C_Dim, new Rectangle(R_CardMul.X + 236, R_CardMul.Y, 38, R_CardMul.Height), StringAlignment.Center);
+            // Hotkey-Feld: Klick, dann Taste oder Maustaste druecken (Esc entfernt)
+            FillRR(g, C_Field, R_MulKey, RadCtl(R_MulKey.Height));
+            StrokeRR(g, capMul ? C_Accent : (hover == Hit.MulKey ? C_Dim : C_CardLine), R_MulKey, RadCtl(R_MulKey.Height), capMul ? 1.5f : 1f);
+            DrawText(g, capMul ? "Taste…" : (mulKey.Code == 0 ? "–" : mulKey.Short()), fChip,
+                capMul ? C_Accent : (mulKey.Code == 0 ? C_Dim : C_Text),
+                new Rectangle(R_MulKey.X + 3, R_MulKey.Y, R_MulKey.Width - 6, R_MulKey.Height), StringAlignment.Center);
             Switch(g, R_MulSw, multiOn, hover == Hit.MulSw);
 
             // Dauer der Overlay-Meldung (1-10 s)
@@ -1882,7 +1933,7 @@ namespace PurpleClicker
                 using (SolidBrush b = new SolidBrush(Color.FromArgb(i < overlaySec ? 90 : 50, 150, 150, 150)))
                     g.FillEllipse(b, tx3 - 1, MUL_Y + 12, 3, 3);
             }
-            DrawText(g, overlaySec + " s", fBtn, C_Accent, new Rectangle(R_CardDur.X + 204, R_CardDur.Y, 44, R_CardDur.Height), StringAlignment.Center);
+            DrawText(g, overlaySec + " s", fBtn, C_Accent, new Rectangle(R_CardDur.X + 186, R_CardDur.Y, 36, R_CardDur.Height), StringAlignment.Center);
 
             // Nur in Programmen
             Card(g, R_CardProg, "NUR IN PROGRAMMEN");
@@ -1997,6 +2048,8 @@ namespace PurpleClicker
                         case "HotCode": hotkey.Code = v; break;
                         case "FilterOn": filterOn = v != 0; break;
                         case "MultiOn": multiOn = v != 0; break;
+                        case "MulHotMouse": mulKey.IsMouse = v != 0; break;
+                        case "MulHotCode": mulKey.Code = v; break;
                         case "Multi": multiplier = Math.Min(Math.Max(v, 1), 10); break;
                         case "OverlaySec": overlaySec = Math.Min(Math.Max(v, 1), 10); break;
                         case "Theme": theme = ThemeFromSetting(raw); break;
@@ -2011,6 +2064,9 @@ namespace PurpleClicker
                     }
                 }
                 if (hotkey.IsMouse && (hotkey.Code < 1 || hotkey.Code > 5)) hotkey = new Hotkey(false, (int)Keys.F6);
+                if ((mulKey.IsMouse && (mulKey.Code < 1 || mulKey.Code > 5)) || mulKey.Code < 0 ||
+                    (mulKey.IsMouse == hotkey.IsMouse && mulKey.Code == hotkey.Code))
+                    mulKey = new Hotkey(false, 0);
             }
             catch { }
         }
@@ -2027,6 +2083,8 @@ namespace PurpleClicker
                     "HotCode=" + hotkey.Code,
                     "FilterOn=" + (filterOn ? 1 : 0),
                     "MultiOn=" + (multiOn ? 1 : 0),
+                    "MulHotMouse=" + (mulKey.IsMouse ? 1 : 0),
+                    "MulHotCode=" + mulKey.Code,
                     "Multi=" + multiplier,
                     "OverlaySec=" + overlaySec,
                     "Theme=" + ThemeNames[theme],
@@ -2050,6 +2108,7 @@ namespace PurpleClicker
                 autostart = true;
                 multiOn = true;
                 multiplier = 10;
+                mulKey = new Hotkey(true, 5);
                 popupOpen = !snapThemePop;
                 themeOpen = snapThemePop;
                 popItems = new List<ProcItem>();
