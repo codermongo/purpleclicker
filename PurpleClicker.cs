@@ -996,7 +996,7 @@ namespace PurpleClicker
                     startGlow = false;
                     famBig = "Segoe UI Semilight";
                     break;
-                case 4: // Sunset: eckig, warm, Glut im Hintergrund
+                case 4: // Sunset: warm, Mono-Ecken, Glut im Hintergrund
                     C_Accent = ThemeA[4]; C_Accent2 = ThemeB[4];
                     C_AccentHover = Color.FromArgb(255, 130, 185);
                     C_Card = Color.FromArgb(26, 15, 20);
@@ -1006,8 +1006,7 @@ namespace PurpleClicker
                     C_BtnHover = Color.FromArgb(68, 40, 50);
                     C_Text = Color.FromArgb(255, 238, 232);
                     C_Dim = Color.FromArgb(160, 118, 126);
-                    radCard = 3; radCtl = 2; radStart = 3;
-                    squareThumb = true;
+                    radCard = 8; radCtl = 8; radStart = 8;   // Ecken wie Mono
                     backdrop = 5;
                     famBtn = "Segoe UI Black"; famBig = "Segoe UI";
                     break;
@@ -1017,7 +1016,7 @@ namespace PurpleClicker
                     C_Card = Color.FromArgb(16, 16, 20);
                     C_Btn = Color.FromArgb(28, 28, 34);
                     C_BtnHover = Color.FromArgb(46, 46, 56);
-                    radCard = 14; radCtl = -1; radStart = 21;
+                    radCard = 8; radCtl = 8; radStart = 8;   // Ecken wie Mono
                     famBtn = "Segoe UI Black";
                     RainbowColors();
                     break;
