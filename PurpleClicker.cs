@@ -490,7 +490,8 @@ namespace PurpleClicker
     {
         None, Close, Min, Drag, Minus, Plus, Number, Slider,
         BtnLeft, BtnRight, ClkSingle, ClkDouble, HotChange, Start,
-        AutoSw, FilterSw, MulSlider, MulSw, DurSlider, ChipX, ChipAdd, PopItem, PopPanel, PopOutside
+        AutoSw, FilterSw, MulSlider, MulSw, DurSlider, ChipX, ChipAdd, PopItem, PopPanel, PopOutside,
+        Gear, ThemeItem, ThemePanel, ThemeOutside
     }
 
     // ------------------------------------------------------------------ Fenster
@@ -499,6 +500,10 @@ namespace PurpleClicker
         // Layout in logischen Pixeln (wird per ScaleTransform auf den Bildschirm-DPI skaliert)
         const int W = 700, H = 506;
         static readonly Rectangle R_Title = new Rectangle(0, 0, W, 56);
+        static readonly Rectangle R_Gear = new Rectangle(574, 13, 30, 30);
+        static readonly Rectangle R_ThemePanel = new Rectangle(500, 50, 180, 188);
+        const int THEME_ROW = 40, THEME_Y0 = 62;
+        static readonly string[] ThemeNames = { "Original", "Aurora", "Mint", "Sunset" };
         static readonly Rectangle R_Min = new Rectangle(612, 13, 30, 30);
         static readonly Rectangle R_Close = new Rectangle(650, 13, 30, 30);
 
@@ -544,16 +549,64 @@ namespace PurpleClicker
         const int POP_ROW = 40, POP_ROWS = 6;
 
         // Farben (AMOLED)
-        static readonly Color C_Bg = Color.FromArgb(0, 0, 0);
-        static readonly Color C_Card = Color.FromArgb(16, 16, 16);
-        static readonly Color C_CardLine = Color.FromArgb(32, 32, 32);
-        static readonly Color C_Field = Color.FromArgb(8, 8, 8);
-        static readonly Color C_Btn = Color.FromArgb(28, 28, 28);
-        static readonly Color C_BtnHover = Color.FromArgb(44, 44, 44);
-        static readonly Color C_Text = Color.FromArgb(237, 237, 237);
-        static readonly Color C_Dim = Color.FromArgb(128, 128, 128);
-        static readonly Color C_Accent = Color.FromArgb(124, 108, 255);
-        static readonly Color C_AccentHover = Color.FromArgb(146, 132, 255);
+        static Color C_Bg = Color.FromArgb(0, 0, 0);
+        static Color C_Card = Color.FromArgb(16, 16, 16);
+        static Color C_CardLine = Color.FromArgb(32, 32, 32);
+        static Color C_Field = Color.FromArgb(8, 8, 8);
+        static Color C_Btn = Color.FromArgb(28, 28, 28);
+        static Color C_BtnHover = Color.FromArgb(44, 44, 44);
+        static Color C_Text = Color.FromArgb(237, 237, 237);
+        static Color C_Dim = Color.FromArgb(128, 128, 128);
+        static Color C_Accent = Color.FromArgb(124, 108, 255);
+        static Color C_AccentHover = Color.FromArgb(146, 132, 255);
+
+        // Themes (0 = Original, 1 = Aurora, 2 = Mint, 3 = Sunset)
+        static bool fancy;
+        static Color C_Accent2 = Color.FromArgb(124, 108, 255);
+        static Color C_CardTop = Color.FromArgb(16, 16, 16);
+        static Color C_CardBottom = Color.FromArgb(16, 16, 16);
+
+        public static bool snapThemePop;
+        public static int themeArg = -1;   // --theme N ueberschreibt die gespeicherte Auswahl
+        int theme;
+        bool themeOpen;
+
+        public static void ApplyTheme(int n)
+        {
+            fancy = n != 0;
+            switch (n)
+            {
+                case 0: // Original
+                    C_Accent = Color.FromArgb(124, 108, 255);
+                    C_Accent2 = C_Accent;
+                    C_AccentHover = Color.FromArgb(146, 132, 255);
+                    C_CardLine = Color.FromArgb(32, 32, 32);
+                    C_Field = Color.FromArgb(8, 8, 8);
+                    break;
+                case 1: // Aurora: Violett -> Cyan
+                    C_Accent = Color.FromArgb(139, 108, 255);
+                    C_Accent2 = Color.FromArgb(56, 189, 248);
+                    C_AccentHover = Color.FromArgb(165, 140, 255);
+                    break;
+                case 2: // Mint: Gruen -> Tuerkis
+                    C_Accent = Color.FromArgb(52, 220, 150);
+                    C_Accent2 = Color.FromArgb(34, 190, 230);
+                    C_AccentHover = Color.FromArgb(90, 235, 175);
+                    break;
+                case 3: // Sunset: Pink -> Orange
+                    C_Accent = Color.FromArgb(255, 94, 160);
+                    C_Accent2 = Color.FromArgb(255, 166, 77);
+                    C_AccentHover = Color.FromArgb(255, 130, 185);
+                    break;
+            }
+            if (fancy)
+            {
+                C_CardTop = Color.FromArgb(26, 26, 32);
+                C_CardBottom = Color.FromArgb(12, 12, 15);
+                C_CardLine = Color.FromArgb(40, 40, 48);
+                C_Field = Color.FromArgb(6, 6, 8);
+            }
+        }
 
         readonly Font fTitle = new Font("Segoe UI Semibold", 11f);
         readonly Font fLabel = new Font("Segoe UI Semibold", 8.25f);
@@ -643,6 +696,9 @@ namespace PurpleClicker
             fgTimer.Tick += delegate { ForegroundTick(); };
 
             LoadSettings();
+            if (themeArg >= 0) theme = themeArg;
+            theme = Math.Min(Math.Max(theme, 0), ThemeNames.Length - 1);
+            ApplyTheme(theme);
             autostart = GetAutostart();
             ApplyToClicker();
         }
@@ -1055,6 +1111,17 @@ namespace PurpleClicker
             hitIndex = -1;
             if (R_Close.Contains(p)) return Hit.Close;
             if (R_Min.Contains(p)) return Hit.Min;
+            if (R_Gear.Contains(p)) return Hit.Gear;
+            if (themeOpen)
+            {
+                if (R_ThemePanel.Contains(p))
+                {
+                    int ti = (p.Y - THEME_Y0) / THEME_ROW;
+                    if (p.Y >= THEME_Y0 && ti >= 0 && ti < ThemeNames.Length) { hitIndex = ti; return Hit.ThemeItem; }
+                    return Hit.ThemePanel;
+                }
+                return Hit.ThemeOutside;
+            }
             if (R_Title.Contains(p)) return Hit.Drag;
 
             if (popupOpen)
@@ -1137,6 +1204,19 @@ namespace PurpleClicker
             {
                 case Hit.Close: Close(); break;
                 case Hit.Min: WindowState = FormWindowState.Minimized; break;
+                case Hit.Gear:
+                    themeOpen = !themeOpen;
+                    if (themeOpen) popupOpen = false;
+                    break;
+                case Hit.ThemeItem:
+                    if (idx >= 0 && idx < ThemeNames.Length)
+                    {
+                        theme = idx;
+                        ApplyTheme(theme);
+                        SaveSettings();
+                    }
+                    break;
+                case Hit.ThemeOutside: themeOpen = false; break;
                 case Hit.Drag:
                     Native.ReleaseCapture();
                     Native.SendMessage(Handle, 0xA1, (IntPtr)2, IntPtr.Zero); // WM_NCLBUTTONDOWN, HTCAPTION
@@ -1220,7 +1300,8 @@ namespace PurpleClicker
             {
                 hover = h;
                 hoverIdx = idx;
-                bool hand = h != Hit.None && h != Hit.Drag && h != Hit.PopPanel && h != Hit.PopOutside;
+                bool hand = h != Hit.None && h != Hit.Drag && h != Hit.PopPanel && h != Hit.PopOutside
+                    && h != Hit.ThemePanel && h != Hit.ThemeOutside;
                 Cursor = hand ? Cursors.Hand : Cursors.Default;
                 Invalidate();
             }
@@ -1258,6 +1339,13 @@ namespace PurpleClicker
         protected override void OnKeyDown(KeyEventArgs e)
         {
             base.OnKeyDown(e);
+            if (themeOpen && e.KeyCode == Keys.Escape)
+            {
+                themeOpen = false;
+                Invalidate();
+                e.Handled = true;
+                return;
+            }
             if (popupOpen && e.KeyCode == Keys.Escape)
             {
                 popupOpen = false;
@@ -1300,6 +1388,53 @@ namespace PurpleClicker
                 g.FillPath(b, p);
         }
 
+        // ---- Verlaufs-Akzent, Glas-Karten, Glow ----
+        static Color Lighten(Color c, float t)
+        {
+            return Color.FromArgb(c.R + (int)((255 - c.R) * t), c.G + (int)((255 - c.G) * t), c.B + (int)((255 - c.B) * t));
+        }
+
+        static void FillAccent(Graphics g, Rectangle r, float rad, bool hot)
+        {
+            if (!fancy || r.Width < 2 || r.Height < 2)
+            {
+                FillRR(g, hot ? C_AccentHover : C_Accent, r, rad);
+                return;
+            }
+            Color a = hot ? Lighten(C_Accent, 0.18f) : C_Accent;
+            Color b = hot ? Lighten(C_Accent2, 0.18f) : C_Accent2;
+            using (GraphicsPath p = RR(r, rad))
+            using (LinearGradientBrush br = new LinearGradientBrush(r, a, b, LinearGradientMode.Horizontal))
+                g.FillPath(br, p);
+        }
+
+        static void FillCard(Graphics g, Rectangle r)
+        {
+            if (!fancy)
+            {
+                FillRR(g, C_Card, r, 14);
+                return;
+            }
+            using (GraphicsPath p = RR(r, 14))
+            using (LinearGradientBrush br = new LinearGradientBrush(r, C_CardTop, C_CardBottom, LinearGradientMode.Vertical))
+                g.FillPath(br, p);
+            using (Pen pen = new Pen(Color.FromArgb(34, 255, 255, 255), 1f))
+                g.DrawLine(pen, r.X + 16, r.Y + 0.5f, r.Right - 16, r.Y + 0.5f);
+        }
+
+        static void StartGlow(Graphics g)
+        {
+            if (!fancy) return;
+            for (int i = 3; i >= 1; i--)
+            {
+                Rectangle gr = R_Start;
+                gr.Inflate(i * 3, i * 2);
+                using (GraphicsPath p = RR(gr, 21 + i * 3))
+                using (Pen pen = new Pen(Color.FromArgb(14 * (4 - i), C_Accent), 3f))
+                    g.DrawPath(pen, p);
+            }
+        }
+
         static void StrokeRR(Graphics g, Color c, Rectangle r, float rad, float w)
         {
             RectangleF rf = new RectangleF(r.X + 0.5f, r.Y + 0.5f, r.Width - 1f, r.Height - 1f);
@@ -1324,7 +1459,7 @@ namespace PurpleClicker
         // Karte mit Label oben links
         void Card(Graphics g, Rectangle r, string label)
         {
-            FillRR(g, C_Card, r, 14);
+            FillCard(g, r);
             StrokeRR(g, C_CardLine, r, 14, 1f);
             DrawText(g, label, fLabel, C_Dim, new Rectangle(r.X + 16, r.Y + 8, 220, 20), StringAlignment.Near);
         }
@@ -1332,7 +1467,7 @@ namespace PurpleClicker
         // Einzeilige Karte mit Label links, vertikal zentriert
         void CardInline(Graphics g, Rectangle r, string label)
         {
-            FillRR(g, C_Card, r, 14);
+            FillCard(g, r);
             StrokeRR(g, C_CardLine, r, 14, 1f);
             DrawText(g, label, fLabel, C_Dim, new Rectangle(r.X + 16, r.Y, 130, r.Height), StringAlignment.Near);
         }
@@ -1352,7 +1487,7 @@ namespace PurpleClicker
             StrokeRR(g, C_CardLine, all, rad, 1f);
             Rectangle sel = rightSel ? right : left;
             sel.Inflate(-3, -3);
-            FillRR(g, hover == (rightSel ? hr : hl) ? C_AccentHover : C_Accent, sel, rad - 3);
+            FillAccent(g, sel, rad - 3, hover == (rightSel ? hr : hl));
             DrawText(g, tl, fBtn, !rightSel ? Color.White : (hover == hl ? C_Text : C_Dim), left, StringAlignment.Center);
             DrawText(g, tr, fBtn, rightSel ? Color.White : (hover == hr ? C_Text : C_Dim), right, StringAlignment.Center);
         }
@@ -1482,6 +1617,8 @@ namespace PurpleClicker
                 g.DrawLine(pen, R_Close.X + 20, R_Close.Y + 10, R_Close.X + 10, R_Close.Y + 20);
             }
 
+            DrawGear(g, hover == Hit.Gear || themeOpen);
+
             // Intervall
             Card(g, R_CardInt, "INTERVALL");
             RoundBtn(g, R_Minus, hover == Hit.Minus, "−");
@@ -1503,7 +1640,7 @@ namespace PurpleClicker
             double t = (Math.Min(Math.Max(intervalMs, 1), 1000) - 1) / 999.0;
             int tx = SL_X + (int)Math.Round(t * SL_W);
             FillRR(g, Color.FromArgb(34, 34, 34), new Rectangle(SL_X, SL_Y - 3, SL_W, 6), 3);
-            FillRR(g, C_Accent, new Rectangle(SL_X, SL_Y - 3, Math.Max(tx - SL_X, 6), 6), 3);
+            FillAccent(g, new Rectangle(SL_X, SL_Y - 3, Math.Max(tx - SL_X, 6), 6), 3, false);
             using (SolidBrush b = new SolidBrush(Color.White))
                 g.FillEllipse(b, tx - 8, SL_Y - 8, 16, 16);
             using (Pen pen = new Pen(C_Accent, 2f))
@@ -1540,7 +1677,7 @@ namespace PurpleClicker
             int mx = MUL_X + (int)Math.Round(mt * MUL_W);
             Color mulColor = multiOn ? C_Accent : Color.FromArgb(70, 70, 70);
             FillRR(g, Color.FromArgb(34, 34, 34), new Rectangle(MUL_X, MUL_Y - 3, MUL_W, 6), 3);
-            FillRR(g, mulColor, new Rectangle(MUL_X, MUL_Y - 3, Math.Max(mx - MUL_X, 6), 6), 3);
+            if (multiOn) FillAccent(g, new Rectangle(MUL_X, MUL_Y - 3, Math.Max(mx - MUL_X, 6), 6), 3, false); else FillRR(g, mulColor, new Rectangle(MUL_X, MUL_Y - 3, Math.Max(mx - MUL_X, 6), 6), 3);
             using (SolidBrush b = new SolidBrush(multiOn ? Color.White : Color.FromArgb(150, 150, 150)))
                 g.FillEllipse(b, mx - 8, MUL_Y - 8, 16, 16);
             using (Pen pen = new Pen(mulColor, 2f))
@@ -1558,7 +1695,7 @@ namespace PurpleClicker
             CardInline(g, R_CardDur, "MELDUNG");
             int dx = DUR_X + (int)Math.Round((overlaySec - 1) / 9.0 * DUR_W);
             FillRR(g, Color.FromArgb(34, 34, 34), new Rectangle(DUR_X, MUL_Y - 3, DUR_W, 6), 3);
-            FillRR(g, C_Accent, new Rectangle(DUR_X, MUL_Y - 3, Math.Max(dx - DUR_X, 6), 6), 3);
+            FillAccent(g, new Rectangle(DUR_X, MUL_Y - 3, Math.Max(dx - DUR_X, 6), 6), 3, false);
             using (SolidBrush b = new SolidBrush(Color.White))
                 g.FillEllipse(b, dx - 8, MUL_Y - 8, 16, 16);
             using (Pen pen = new Pen(C_Accent, 2f))
@@ -1596,11 +1733,80 @@ namespace PurpleClicker
             }
             else
             {
-                FillRR(g, hover == Hit.Start ? C_AccentHover : C_Accent, R_Start, 21);
+                StartGlow(g);
+                FillAccent(g, R_Start, 21, hover == Hit.Start);
                 DrawText(g, "START  ·  " + hotkey.Short(), fBtn, Color.White, R_Start, StringAlignment.Center);
             }
 
             if (popupOpen) DrawPopup(g);
+            if (themeOpen) DrawThemeMenu(g);
+        }
+
+        static readonly Color[] ThemeA = {
+            Color.FromArgb(124, 108, 255), Color.FromArgb(139, 108, 255),
+            Color.FromArgb(52, 220, 150), Color.FromArgb(255, 94, 160) };
+        static readonly Color[] ThemeB = {
+            Color.FromArgb(124, 108, 255), Color.FromArgb(56, 189, 248),
+            Color.FromArgb(34, 190, 230), Color.FromArgb(255, 166, 77) };
+
+        // Zahnrad oben rechts (Theme-Auswahl)
+        void DrawGear(Graphics g, bool hot)
+        {
+            using (SolidBrush b = new SolidBrush(hot ? C_BtnHover : C_Btn))
+                g.FillEllipse(b, R_Gear);
+            float cx = R_Gear.X + R_Gear.Width / 2f, cy = R_Gear.Y + R_Gear.Height / 2f;
+            const float rOut = 8.6f, rIn = 6.4f;
+            List<PointF> pts = new List<PointF>();
+            for (int k = 0; k < 8; k++)
+            {
+                double[] ang = { k * 45 - 9, k * 45 + 9, k * 45 + 13.5, k * 45 + 31.5 };
+                float[] rad = { rOut, rOut, rIn, rIn };
+                for (int j = 0; j < 4; j++)
+                {
+                    double a = ang[j] * Math.PI / 180.0;
+                    pts.Add(new PointF(cx + (float)(Math.Cos(a) * rad[j]), cy + (float)(Math.Sin(a) * rad[j])));
+                }
+            }
+            using (SolidBrush b = new SolidBrush(hot ? Color.White : C_Text))
+                g.FillPolygon(b, pts.ToArray());
+            using (SolidBrush b = new SolidBrush(hot ? C_BtnHover : C_Btn))
+                g.FillEllipse(b, cx - 3f, cy - 3f, 6f, 6f);
+        }
+
+        void DrawThemeMenu(Graphics g)
+        {
+            FillRR(g, Color.FromArgb(18, 18, 22), R_ThemePanel, 14);
+            StrokeRR(g, Color.FromArgb(70, 70, 82), R_ThemePanel, 14, 1f);
+            for (int i = 0; i < ThemeNames.Length; i++)
+            {
+                Rectangle r = new Rectangle(R_ThemePanel.X + 8, THEME_Y0 + i * THEME_ROW, R_ThemePanel.Width - 16, THEME_ROW - 4);
+                bool sel = i == theme;
+                bool hot = hover == Hit.ThemeItem && hoverIdx == i;
+                if (sel) FillRR(g, Color.FromArgb(40, ThemeA[i]), r, 10);
+                else if (hot) FillRR(g, C_BtnHover, r, 10);
+                Rectangle sw = new Rectangle(r.X + 12, r.Y + (r.Height - 18) / 2, 18, 18);
+                if (i == 0)
+                {
+                    using (SolidBrush b = new SolidBrush(ThemeA[0])) g.FillEllipse(b, sw);
+                }
+                else
+                {
+                    using (LinearGradientBrush br = new LinearGradientBrush(sw, ThemeA[i], ThemeB[i], LinearGradientMode.ForwardDiagonal))
+                        g.FillEllipse(br, sw);
+                }
+                DrawText(g, ThemeNames[i], fBtn, sel || hot ? C_Text : C_Dim, new Rectangle(r.X + 40, r.Y, 90, r.Height), StringAlignment.Near);
+                if (sel)
+                {
+                    using (Pen pen = new Pen(ThemeA[i], 2f))
+                    {
+                        pen.StartCap = LineCap.Round;
+                        pen.EndCap = LineCap.Round;
+                        pen.LineJoin = LineJoin.Round;
+                        int ox = r.Right - 26, oy = r.Y + r.Height / 2;
+                        g.DrawLines(pen, new Point[] { new Point(ox, oy), new Point(ox + 4, oy + 4), new Point(ox + 11, oy - 4) });
+                    }
+                }
+            }
         }
 
         // ---------------------------------------------------------- Einstellungen
@@ -1628,6 +1834,7 @@ namespace PurpleClicker
                         case "MultiOn": multiOn = v != 0; break;
                         case "Multi": multiplier = Math.Min(Math.Max(v, 1), 10); break;
                         case "OverlaySec": overlaySec = Math.Min(Math.Max(v, 1), 10); break;
+                        case "Theme": theme = v; break;
                         case "Programs":
                             programs.Clear();
                             foreach (string s in raw.Split(';'))
@@ -1657,6 +1864,7 @@ namespace PurpleClicker
                     "MultiOn=" + (multiOn ? 1 : 0),
                     "Multi=" + multiplier,
                     "OverlaySec=" + overlaySec,
+                    "Theme=" + theme,
                     "Programs=" + string.Join(";", programs.ToArray())
                 });
             }
@@ -1677,7 +1885,8 @@ namespace PurpleClicker
                 autostart = true;
                 multiOn = true;
                 multiplier = 10;
-                popupOpen = true;
+                popupOpen = !snapThemePop;
+                themeOpen = snapThemePop;
                 popItems = new List<ProcItem>();
                 popItems.Add(new ProcItem("chrome.exe", "Neuer Tab - Google Chrome"));
                 popItems.Add(new ProcItem("explorer.exe", "Dieser PC"));
@@ -1690,6 +1899,7 @@ namespace PurpleClicker
                 {
                     // Chips werden beim ersten Zeichnen berechnet; fuer die Ansicht ohne Popup nochmal rendern
                     popupOpen = false;
+                    themeOpen = false;
                     using (Bitmap bmp2 = new Bitmap(ClientSize.Width, ClientSize.Height))
                     {
                         DrawToBitmap(bmp2, new Rectangle(0, 0, bmp2.Width, bmp2.Height));
@@ -1725,6 +1935,8 @@ namespace PurpleClicker
                 if (args[i] == "--tray") tray = true;
                 else if (args[i] == "--snapshot" && i + 1 < args.Length) { snapshot = true; snapPath = args[++i]; }
                 else if (args[i] == "--demo") demo = true;
+                else if (args[i] == "--theme" && i + 1 < args.Length) { int tn; int.TryParse(args[++i], out tn); MainForm.themeArg = tn; }
+                else if (args[i] == "--themepop") MainForm.snapThemePop = true;
             }
 
             bool created;
