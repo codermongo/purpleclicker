@@ -300,6 +300,232 @@ namespace PurpleClicker
         }
     }
 
+    // ------------------------------------------------------------------ Maus-Umbelegung
+    // Eingaben (physisch): 0 Links, 1 Rechts, 2 Mitte, 3 Maus 4, 4 Maus 5, 5 Rad hoch, 6 Rad runter, 7 Rad links kippen, 8 Rad rechts kippen
+    // Aktionen: 0 Standard, 1 Links, 2 Rechts, 3 Mitte, 4 Maus 4, 5 Maus 5, 6 Rad hoch, 7 Rad runter, 8 Doppelklick, 9 Deaktiviert
+    class Remapper
+    {
+        public const int Inputs = 9;
+        public static readonly string[] InputNames = {
+            "Linke Taste", "Rechte Taste", "Mausrad-Klick", "Seitentaste hinten (Maus 4)", "Seitentaste vorne (Maus 5)",
+            "Rad nach oben", "Rad nach unten", "Rad nach links kippen", "Rad nach rechts kippen" };
+        public static readonly string[] ActionNames = {
+            "Standard", "Linksklick", "Rechtsklick", "Mittelklick", "Maus 4 (Zurück)", "Maus 5 (Vor)",
+            "Rad hoch", "Rad runter", "Doppelklick", "Deaktiviert" };
+
+        public volatile bool On;
+        public readonly int[] Map = new int[Inputs];
+
+        // Sendet ein Mausereignis (flags, mouseData); austauschbar fuer Tests
+        public Action<uint, uint> Send;
+        // Wird gemeldet, wenn die Umbelegung einen Klick der Taste 1..5 beendet hat (fuer den Multiplikator)
+        public Action<int> OnClick;
+
+        readonly int[] held = new int[6];     // Aktion, die zur gerade gedrueckten Taste 1..5 gehoert (0 = keine)
+        readonly int[] wheelAcc = new int[Inputs];
+
+        public Remapper() { Send = SendMouse; }
+
+        // Aktion, die der Eingabe selbst entspricht (= "Standard"), wird beim Durchschalten uebersprungen
+        public static bool IsSelf(int input, int act)
+        {
+            if (input <= 4) return act == input + 1;
+            if (input == 5) return act == 6;
+            if (input == 6) return act == 7;
+            return false;
+        }
+
+        public void Cycle(int input, int dir)
+        {
+            int a = Map[input];
+            for (int i = 0; i < ActionNames.Length; i++)
+            {
+                a = (a + dir + ActionNames.Length) % ActionNames.Length;
+                if (!IsSelf(input, a)) break;
+            }
+            Map[input] = a;
+        }
+
+        public bool IsHeld(int btn) { return btn >= 1 && btn <= 5 && held[btn] != 0; }
+
+        public bool Any()
+        {
+            for (int i = 0; i < Inputs; i++) if (Map[i] != 0) return true;
+            return false;
+        }
+
+        // Taste 1..5. Gibt true zurueck, wenn das Original-Ereignis verschluckt werden soll.
+        public bool Button(int btn, bool down, bool allowed)
+        {
+            if (btn < 1 || btn > 5) return false;
+            if (!down)
+            {
+                int h = held[btn];
+                if (h == 0) return false;
+                held[btn] = 0;
+                Release(h);
+                return true;
+            }
+            if (!On || !allowed) return false;
+            int t = Map[btn - 1];
+            if (t == 0 || IsSelf(btn - 1, t)) return false;
+            held[btn] = t;
+            Press(t);
+            return true;
+        }
+
+        // Rad: horizontal = Kippen. Gibt true zurueck, wenn das Original verschluckt werden soll.
+        public bool Wheel(bool horizontal, int delta, bool allowed)
+        {
+            if (delta == 0) return false;
+            int input = horizontal ? (delta > 0 ? 8 : 7) : (delta > 0 ? 5 : 6);
+            int other = horizontal ? (delta > 0 ? 7 : 8) : (delta > 0 ? 6 : 5);
+            wheelAcc[other] = 0;
+            if (!On || !allowed) return false;
+            int t = Map[input];
+            if (t == 0 || IsSelf(input, t)) { wheelAcc[input] = 0; return false; }
+            wheelAcc[input] += Math.Abs(delta);
+            while (wheelAcc[input] >= 120)
+            {
+                wheelAcc[input] -= 120;
+                Pulse(t);
+            }
+            return true;
+        }
+
+        // Gedrueckte umbelegte Tasten sauber loslassen (Umbelegung aus, Programmende)
+        public void ReleaseAll()
+        {
+            for (int b = 1; b <= 5; b++)
+                if (held[b] != 0) { int h = held[b]; held[b] = 0; Release(h); }
+            Array.Clear(wheelAcc, 0, wheelAcc.Length);
+        }
+
+        void Press(int t)
+        {
+            if (t >= 1 && t <= 5) Btn(t, true);
+            else if (t >= 6) Pulse(t);
+        }
+
+        void Release(int t)
+        {
+            if (t >= 1 && t <= 5) { Btn(t, false); if (OnClick != null) OnClick(t); }
+        }
+
+        // Einmalige Aktion (fuer Rad-Schritte und Tasten, die keine Haltedauer haben)
+        void Pulse(int t)
+        {
+            if (t >= 1 && t <= 5) { Btn(t, true); Btn(t, false); if (OnClick != null) OnClick(t); }
+            else if (t == 6) Send(0x0800, 120);
+            else if (t == 7) Send(0x0800, unchecked((uint)(-120)));
+            else if (t == 8)
+            {
+                Btn(1, true); Btn(1, false);
+                Btn(1, true); Btn(1, false);
+                if (OnClick != null) OnClick(1);
+            }
+        }
+
+        void Btn(int b, bool down)
+        {
+            switch (b)
+            {
+                case 1: Send(down ? 0x0002u : 0x0004u, 0); break;
+                case 2: Send(down ? 0x0008u : 0x0010u, 0); break;
+                case 3: Send(down ? 0x0020u : 0x0040u, 0); break;
+                case 4: Send(down ? 0x0080u : 0x0100u, 1); break;
+                case 5: Send(down ? 0x0080u : 0x0100u, 2); break;
+            }
+        }
+
+        static void SendMouse(uint flags, uint data)
+        {
+            Native.INPUT[] a = new Native.INPUT[1];
+            a[0].type = 0; // INPUT_MOUSE
+            a[0].mi.dwFlags = flags;
+            a[0].mi.mouseData = data;
+            Native.SendInput(1, a, Marshal.SizeOf(typeof(Native.INPUT)));
+        }
+
+        public string Serialize()
+        {
+            string[] p = new string[Inputs];
+            for (int i = 0; i < Inputs; i++) p[i] = Map[i].ToString();
+            return string.Join(",", p);
+        }
+
+        public void Load(string raw)
+        {
+            string[] p = raw.Split(',');
+            for (int i = 0; i < Inputs && i < p.Length; i++)
+            {
+                int v;
+                int.TryParse(p[i].Trim(), out v);
+                Map[i] = v < 0 || v >= ActionNames.Length || IsSelf(i, v) ? 0 : v;
+            }
+        }
+    }
+
+    // Erkennt die angeschlossenen Mäuse (Raw Input) und liefert Tastenzahl + ggf. ein bekanntes Foto
+    static class MouseDetect
+    {
+        [StructLayout(LayoutKind.Sequential)] struct RAWINPUTDEVICELIST { public IntPtr hDevice; public uint dwType; }
+        [StructLayout(LayoutKind.Sequential)] struct RID_DEVICE_INFO_MOUSE { public uint dwId; public uint dwNumberOfButtons; public uint dwSampleRate; public bool fHasHorizontalWheel; }
+        [StructLayout(LayoutKind.Explicit, Size = 32)] struct RID_DEVICE_INFO { [FieldOffset(0)] public uint cbSize; [FieldOffset(4)] public uint dwType; [FieldOffset(8)] public RID_DEVICE_INFO_MOUSE mouse; }
+
+        [DllImport("user32.dll")] static extern uint GetRawInputDeviceList([In, Out] RAWINPUTDEVICELIST[] list, ref uint n, uint size);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern uint GetRawInputDeviceInfo(IntPtr h, uint cmd, StringBuilder data, ref uint size);
+        [DllImport("user32.dll")] static extern uint GetRawInputDeviceInfo(IntPtr h, uint cmd, ref RID_DEVICE_INFO data, ref uint size);
+
+        // bekannte Mäuse mit eigenem Foto: Geräte-Kennung -> Name der eingebetteten Bilddatei
+        static readonly string[] KnownIds = { "VID_0B05&PID_1ACE" };
+        static readonly string[] KnownPhotos = { "mouse-photo.png" };
+
+        public static bool Found;       // mindestens eine Maus gefunden
+        public static int Buttons;      // Tastenzahl laut Windows (groesste unter den Maeusen)
+        public static string Photo;     // Bildname, wenn eine bekannte Maus gefunden wurde, sonst null
+        public static string Id = "";   // "0B05:1ACE" der bekannten bzw. ersten echten Maus
+
+        public static void Refresh()
+        {
+            Found = false; Buttons = 0; Photo = null; Id = "";
+            try
+            {
+                uint n = 0;
+                uint sz = (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICELIST));
+                GetRawInputDeviceList(null, ref n, sz);
+                if (n == 0) return;
+                RAWINPUTDEVICELIST[] list = new RAWINPUTDEVICELIST[n];
+                if (GetRawInputDeviceList(list, ref n, sz) == uint.MaxValue) return;
+                for (int i = 0; i < n; i++)
+                {
+                    if (list[i].dwType != 0) continue; // RIM_TYPEMOUSE
+                    uint len = 0;
+                    GetRawInputDeviceInfo(list[i].hDevice, 0x20000007, null, ref len); // RIDI_DEVICENAME
+                    StringBuilder name = new StringBuilder((int)len + 1);
+                    GetRawInputDeviceInfo(list[i].hDevice, 0x20000007, name, ref len);
+                    string path = name.ToString().ToUpperInvariant();
+                    if (path.IndexOf("VID_") < 0) continue; // virtuelle Geraete (Remote-Desktop usw.) ueberspringen
+
+                    RID_DEVICE_INFO info = new RID_DEVICE_INFO();
+                    info.cbSize = (uint)Marshal.SizeOf(typeof(RID_DEVICE_INFO));
+                    uint isz = info.cbSize;
+                    int btn = 0;
+                    if (GetRawInputDeviceInfo(list[i].hDevice, 0x2000000b, ref info, ref isz) != uint.MaxValue)
+                        btn = (int)info.mouse.dwNumberOfButtons;
+                    Found = true;
+                    if (btn > Buttons) Buttons = btn;
+                    int v = path.IndexOf("VID_"), p = path.IndexOf("PID_");
+                    string id = v >= 0 && p >= 0 && path.Length >= p + 8 ? path.Substring(v + 4, 4) + ":" + path.Substring(p + 4, 4) : "";
+                    if (Id.Length == 0) Id = id;
+                    for (int k = 0; k < KnownIds.Length; k++)
+                        if (path.IndexOf(KnownIds[k]) >= 0) { Photo = KnownPhotos[k]; Id = id; }
+                }
+            }
+            catch { }
+        }
+    }
+
     class ProcItem
     {
         public string Exe;
@@ -491,7 +717,8 @@ namespace PurpleClicker
         None, Close, Min, Drag, Minus, Plus, Number, Slider,
         BtnLeft, BtnRight, ClkSingle, ClkDouble, HotChange, Start,
         AutoSw, FilterSw, MulSlider, MulSw, MulKey, DurSlider, ChipX, ChipAdd, PopItem, PopPanel, PopOutside,
-        Gear, ThemeItem, ThemePanel, ThemeOutside
+        Gear, ThemeItem, ThemePanel, ThemeOutside,
+        MouseBtn, RmSw, RmPrev, RmNext, RmMid, RmReset, RmBadge, RmRow, RmModel, RmRec
     }
 
     // ------------------------------------------------------------------ Fenster
@@ -526,8 +753,23 @@ namespace PurpleClicker
         static readonly Rectangle R_HotBtn = new Rectangle(582, 200, 76, 28);
 
         // Autostart sitzt in der Titelleiste
-        static readonly Rectangle R_AutoHit = new Rectangle(404, 13, 158, 30);
-        static readonly Rectangle R_AutoSw = new Rectangle(516, 16, 44, 24);
+        static readonly Rectangle R_AutoHit = new Rectangle(360, 13, 158, 30);
+        static readonly Rectangle R_AutoSw = new Rectangle(474, 16, 44, 24);
+        // Maus-Seite (Umbelegung)
+        static readonly Rectangle R_MouseBtn = new Rectangle(536, 13, 30, 30);
+        static readonly Rectangle R_RmCard = new Rectangle(20, 64, 660, 374);
+        static readonly Rectangle R_RmSw = new Rectangle(620, 72, 44, 24);
+        const int RM_Y0 = 108, RM_ROW = 35, RM_H = 30, RM_PILL_X = 424, RM_PILL_W = 236, RM_ARROW = 34;
+        const int RM_LIST_X = 246;   // Zeilen beginnen hier (links davon: Mausbild)
+        // Mausbild: Zeichenflaeche 236 x 437 (Koordinaten des Fotos), skaliert in die linke Haelfte der Karte
+        const float MS_X = 36f, MS_Y = 98f, MS_S = 0.70f, MS_W = 236f, MS_H = 437f;
+        static readonly Rectangle R_RmRec = new Rectangle(40, 384, 176, 26);     // "Tasten aufnehmen" / "Fertig"
+        static readonly Rectangle R_RmModel = new Rectangle(28, 414, 212, 20);
+        // Markerpositionen je Eingabe im Bild (-1 = kein Marker auf der Maus) und Radius (logische px)
+        static readonly float[] BadgeX = { 70, 166, 118, 20, 20, 118, 118, -1, -1 };
+        static readonly float[] BadgeY = { 88, 88, 88, 160, 219, 36, 136, -1, -1 };
+        static readonly float[] BadgeR = { 11, 11, 11, 11, 11, 8, 8, 0, 0 };
+        static readonly string[] ShortNames = { "Linke Taste", "Rechte Taste", "Mausrad-Klick", "Maus 4 (hinten)", "Maus 5 (vorne)", "Rad hoch", "Rad runter", "Rad kippen links", "Rad kippen rechts" };
 
         static readonly Rectangle R_CardMul = new Rectangle(20, 262, 420, 56);
         static readonly Rectangle R_MulSlider = new Rectangle(140, 268, 116, 44);
@@ -584,6 +826,9 @@ namespace PurpleClicker
         static string stopFmt = "STOP  ·  {0}";
 
         public static bool snapThemePop;
+        public static int snapPage;
+        public static int snapView = -1;
+        public static int snapRec;
         public static int themeArg = -1;   // --theme N ueberschreibt die gespeicherte Auswahl
         int theme;
         bool themeOpen;
@@ -732,6 +977,18 @@ namespace PurpleClicker
         IntPtr keyHook = IntPtr.Zero;
 
         Hotkey hotkey = new Hotkey(false, (int)Keys.F6);
+        readonly Remapper remap = new Remapper();   // Maus-Umbelegung
+        int page;                                   // 0 = Hauptseite, 1 = Maus-Umbelegung
+        int rmSel = -1;                             // im Mausbild gewaehlte Eingabe
+        int mouseView;                              // 0 Auto, 1 Foto, 2 gezeichnet (5 Tasten), 3 gezeichnet (3 Tasten)
+        Bitmap mousePhoto;                          // aus der exe, null wenn nicht eingebettet
+        // Aufnahme-Modus: sammelt, welche Eingaben Windows von der Maus sieht
+        bool recording;
+        readonly bool[] recSeen = new bool[Remapper.Inputs];
+        int recStart;
+        readonly bool[] rmSeen = new bool[Remapper.Inputs];   // Ergebnis der letzten Aufnahme
+        bool rmSeenKnown;
+        string rmNote = "";
         Hotkey mulKey = new Hotkey(false, 0);   // Hotkey fuer den Multiplikator (Code 0 = keiner)
         bool capturing;
         int capTarget;                          // 0 = Start/Stop-Hotkey, 1 = Multiplikator-Hotkey
@@ -801,7 +1058,16 @@ namespace PurpleClicker
             fgTimer.Interval = 250;
             fgTimer.Tick += delegate { ForegroundTick(); };
 
+            remap.OnClick = delegate(int b)
+            {
+                // Von der Umbelegung erzeugter Klick zaehlt fuer den Multiplikator wie ein echter
+                if (multiOn && multiplier > 1 && active && b == (clicker.Right ? 2 : 1))
+                    clicker.Burst(multiplier - 1);
+            };
             LoadSettings();
+            if (snapView >= 0) mouseView = snapView;
+            mousePhoto = LoadPhoto("mouse-photo.png");
+            MouseDetect.Refresh();
             if (themeArg >= 0) theme = themeArg;
             theme = Math.Min(Math.Max(theme, 0), ThemeNames.Length - 1);
             ApplyTheme(theme);
@@ -871,6 +1137,12 @@ namespace PurpleClicker
             menu.ForeColor = C_Text;
             menu.Font = new Font("Segoe UI", 9.5f);
             menu.Items.Add("Öffnen", null, delegate { ShowFromTray(); });
+            // Notausgang: Umbelegung jederzeit ueber das Tray-Menue an-/ausschalten
+            ToolStripMenuItem rmItem = new ToolStripMenuItem("Maus-Umbelegung aktiv");
+            rmItem.CheckOnClick = true;
+            rmItem.Click += delegate { SetRemapOn(rmItem.Checked); };
+            menu.Opening += delegate { rmItem.Checked = remap.On; };
+            menu.Items.Add(rmItem);
             menu.Items.Add("Beenden", null, delegate { ExitApp(); });
             notify = new NotifyIcon();
             notify.Icon = Icon;
@@ -899,6 +1171,13 @@ namespace PurpleClicker
 
             fgTimer.Start();
             ForegroundTick();
+        }
+
+        void SetRemapOn(bool on)
+        {
+            remap.On = on;
+            if (!on) remap.ReleaseAll();
+            Invalidate();
         }
 
         void ShowFromTray()
@@ -932,6 +1211,8 @@ namespace PurpleClicker
             fgTimer.Stop();
             clicker.SetRunning(false);
             clicker.Dispose();
+            remap.On = false;
+            remap.ReleaseAll();
             if (showEvent != null) { try { showEvent.Set(); } catch { } }
             if (notify != null) { notify.Visible = false; notify.Dispose(); notify = null; }
             if (mouseHook != IntPtr.Zero) Native.UnhookWindowsHookEx(mouseHook);
@@ -950,7 +1231,14 @@ namespace PurpleClicker
                 {
                     int btn = 0;
                     bool down = false;
-                    switch ((int)wParam)
+                    int wmsg = (int)wParam;
+                    if (wmsg == 0x20A || wmsg == 0x20E)   // Rad / Kippen
+                    {
+                        int delta = (short)((s.mouseData >> 16) & 0xFFFF);
+                        if (HandleWheel(wmsg == 0x20E, delta, new Point(s.pt.X, s.pt.Y)))
+                            return (IntPtr)1;
+                    }
+                    switch (wmsg)
                     {
                         case 0x201: btn = 1; down = true; break;
                         case 0x202: btn = 1; break;
@@ -985,16 +1273,82 @@ namespace PurpleClicker
             return h != IntPtr.Zero && Native.GetAncestor(h, 2) == Handle; // GA_ROOT
         }
 
+        // Umbelegung nur, wenn eingeschaltet, der Programm-Filter passt und der Zeiger nicht ueber unserem Fenster liegt
+        bool RemapAllowed(Point pt)
+        {
+            return remap.On && active && !capturing && !IsOwnWindowAt(pt);
+        }
+
+        // ---------------------------------------------------------- Aufnahme-Modus
+        void StartRecording()
+        {
+            capturing = false;
+            editing = false;
+            remap.ReleaseAll();
+            Array.Clear(recSeen, 0, recSeen.Length);
+            recSeen[0] = true;          // der Klick auf "Aufnehmen" war die linke Taste
+            recStart = Environment.TickCount;
+            rmNote = "";
+            recording = true;
+            Invalidate();
+        }
+
+        void EndRecording(bool apply)
+        {
+            if (!recording) return;
+            recording = false;
+            int buttons = 0;
+            for (int i = 0; i < 5; i++) if (recSeen[i]) buttons++;
+            bool wheel = recSeen[5] || recSeen[6], tilt = recSeen[7] || recSeen[8];
+            if (!apply) rmNote = "Aufnahme abgebrochen";
+            else if (buttons <= 1 && !wheel && !tilt) rmNote = "Nichts erkannt – Aufnahme verworfen";
+            else
+            {
+                Array.Copy(recSeen, rmSeen, rmSeen.Length);
+                rmSeenKnown = true;
+                // Ohne bekanntes Foto passend zur Tastenzahl das gezeichnete Modell waehlen
+                if (!(MouseDetect.Photo != null && mousePhoto != null))
+                    mouseView = recSeen[3] || recSeen[4] ? 2 : 3;
+                rmNote = "Erkannt: " + buttons + " Tasten" + (wheel ? " + Rad" : "") + (tilt ? " + Kippen" : "");
+                SaveSettings();
+            }
+            Invalidate();
+        }
+
+        bool HandleWheel(bool horizontal, int delta, Point pt)
+        {
+            if (recording)
+            {
+                int w = horizontal ? (delta < 0 ? 7 : 8) : (delta > 0 ? 5 : 6);
+                recSeen[w] = true;
+                Invalidate();
+                return true;
+            }
+            if (!remap.On) return false;
+            return remap.Wheel(horizontal, delta, RemapAllowed(pt));
+        }
+
         bool HandleMouse(int btn, bool down, Point pt)
         {
             if (!down)
             {
                 if (swallowUp[btn]) { swallowUp[btn] = false; return true; }
+                if (recording) return false;
+                if (remap.Button(btn, false, false)) return true;   // Loslassen einer umbelegten Taste
                 // Multiplikator: echter Klick (Hook ignoriert eigene) -> N-1 zusaetzliche Klicks nach dem Loslassen
                 if (multiOn && multiplier > 1 && active && !capturing &&
                     btn == (clicker.Right ? 2 : 1) && !IsOwnWindowAt(pt))
                     clicker.Burst(multiplier - 1);
                 return false;
+            }
+            if (recording)
+            {
+                // Links/Rechts nur mitzaehlen und durchlassen (Bedienung des Fensters), alles andere schlucken
+                recSeen[btn - 1] = true;
+                Invalidate();
+                if (btn <= 2) return false;
+                swallowUp[btn] = true;
+                return true;
             }
             // Links/Rechts im eigenen sichtbaren Fenster nie abfangen, sonst waere die Bedienung blockiert
             if (btn <= 2 && IsOwnWindowAt(pt)) return false;
@@ -1020,7 +1374,7 @@ namespace PurpleClicker
                 ToggleMulti();
                 return true;
             }
-            return false;
+            return remap.On && remap.Button(btn, true, RemapAllowed(pt));
         }
 
         // Belegt den gerade gewaehlten Hotkey (Start/Stop oder Multiplikator); keine Doppelbelegung
@@ -1071,6 +1425,16 @@ namespace PurpleClicker
             if (!down)
                 return swallowedKeys.Remove(vk);
 
+            if (recording)
+            {
+                if (vk == (int)Keys.Return || vk == (int)Keys.Escape)
+                {
+                    swallowedKeys.Add(vk);
+                    EndRecording(vk == (int)Keys.Return);
+                    return true;
+                }
+                return false;
+            }
             if (capturing)
             {
                 capturing = false;
@@ -1107,6 +1471,7 @@ namespace PurpleClicker
                 foreach (string p in programs)
                     if (p == exe) { match = true; break; }
 
+            if (recording && Environment.TickCount - recStart > 90000) { EndRecording(false); rmNote = "Zeit abgelaufen"; }
             bool newActive = !filterOn || own || match;
 
             // Overlay jedes Mal, wenn ein gewaehltes Programm in den Vordergrund kommt
@@ -1267,8 +1632,10 @@ namespace PurpleClicker
                 }
                 return Hit.ThemeOutside;
             }
-            if (!popupOpen && R_AutoHit.Contains(p)) return Hit.AutoSw;
+            if (page == 0 && !popupOpen && R_AutoHit.Contains(p)) return Hit.AutoSw;
+            if (R_MouseBtn.Contains(p)) return Hit.MouseBtn;
             if (R_Title.Contains(p)) return Hit.Drag;
+            if (page == 1) return HitRemap(p);
 
             if (popupOpen)
             {
@@ -1306,6 +1673,88 @@ namespace PurpleClicker
             }
             if (addRect.Contains(p) && programs.Count < MAX_PROGRAMS) return Hit.ChipAdd;
             if (R_Start.Contains(p)) return Hit.Start;
+            return Hit.None;
+        }
+
+        string SeenString()
+        {
+            if (!rmSeenKnown) return "";
+            char[] c = new char[rmSeen.Length];
+            for (int i = 0; i < c.Length; i++) c[i] = rmSeen[i] ? '1' : '0';
+            return new string(c);
+        }
+
+        static Bitmap LoadPhoto(string name)
+        {
+            try
+            {
+                using (Stream s = System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream(name))
+                {
+                    if (s == null) return null;
+                    using (Bitmap raw = new Bitmap(s)) return new Bitmap(raw); // Kopie, damit der Stream frei wird
+                }
+            }
+            catch { return null; }
+        }
+
+        // Welches Mausbild gezeigt wird: 0 Foto, 1 gezeichnet mit 5 Tasten, 2 gezeichnet mit 3 Tasten
+        int RmModelKind()
+        {
+            switch (mouseView)
+            {
+                case 1: return mousePhoto != null ? 0 : 1;
+                case 2: return 1;
+                case 3: return 2;
+            }
+            if (MouseDetect.Photo != null && mousePhoto != null) return 0;
+            return MouseDetect.Found && MouseDetect.Buttons < 5 ? 2 : 1;
+        }
+
+        static bool BadgeShown(int i, int kind)
+        {
+            return BadgeX[i] >= 0 && !(kind == 2 && (i == 3 || i == 4));
+        }
+
+        static PointF BadgePt(int i)
+        {
+            return new PointF(MS_X + BadgeX[i] * MS_S, MS_Y + BadgeY[i] * MS_S);
+        }
+
+        string RmModelText()
+        {
+            string t;
+            if (mouseView == 0)
+            {
+                if (!MouseDetect.Found) t = "Keine Maus erkannt";
+                else t = "Erkannt: " + MouseDetect.Id + " · " + MouseDetect.Buttons + " Tasten";
+            }
+            else t = "Ansicht: " + (mouseView == 1 ? "Foto" : mouseView == 2 ? "gezeichnet, 5 Tasten" : "gezeichnet, 3 Tasten");
+            return t;
+        }
+
+        Hit HitRemap(Point p)
+        {
+            if (R_RmSw.Contains(p)) return Hit.RmSw;
+            if (R_Start.Contains(p)) return Hit.RmReset;
+            if (R_RmRec.Contains(p)) return Hit.RmRec;
+            if (R_RmModel.Contains(p)) return Hit.RmModel;
+            int kind = RmModelKind();
+            for (int i = 0; i < Remapper.Inputs; i++)
+            {
+                if (!BadgeShown(i, kind)) continue;
+                PointF c = BadgePt(i);
+                float dx = p.X - c.X, dy = p.Y - c.Y, r = BadgeR[i] + 3;
+                if (dx * dx + dy * dy <= r * r) { hitIndex = i; return Hit.RmBadge; }
+            }
+            for (int i = 0; i < Remapper.Inputs; i++)
+            {
+                int y = RM_Y0 + i * RM_ROW;
+                if (p.Y < y || p.Y >= y + RM_H) continue;
+                if (p.X >= RM_LIST_X && p.X < RM_PILL_X) { hitIndex = i; return Hit.RmRow; }
+                if (p.X >= RM_PILL_X && p.X < RM_PILL_X + RM_ARROW) { hitIndex = i; return Hit.RmPrev; }
+                if (p.X >= RM_PILL_X + RM_PILL_W - RM_ARROW && p.X < RM_PILL_X + RM_PILL_W) { hitIndex = i; return Hit.RmNext; }
+                if (p.X >= RM_PILL_X && p.X < RM_PILL_X + RM_PILL_W) { hitIndex = i; return Hit.RmMid; }
+            }
             return Hit.None;
         }
 
@@ -1364,6 +1813,30 @@ namespace PurpleClicker
                     }
                     break;
                 case Hit.ThemeOutside: themeOpen = false; break;
+                case Hit.MouseBtn:
+                    EndRecording(false);
+                    page = page == 1 ? 0 : 1;
+                    if (page == 1) MouseDetect.Refresh(); // Maus evtl. inzwischen gewechselt
+                    popupOpen = false;
+                    themeOpen = false;
+                    break;
+                case Hit.RmSw: SetRemapOn(!remap.On); break;
+                case Hit.RmPrev: if (idx >= 0) remap.Cycle(idx, -1); break;
+                case Hit.RmNext:
+                case Hit.RmMid: if (idx >= 0) remap.Cycle(idx, 1); break;
+                case Hit.RmReset: Array.Clear(remap.Map, 0, remap.Map.Length); break;
+                case Hit.RmBadge: rmSel = rmSel == idx ? -1 : idx; break;
+                case Hit.RmRow: rmSel = rmSel == idx ? -1 : idx; break;
+                case Hit.RmRec:
+                    if (recording) EndRecording(true); else StartRecording();
+                    break;
+                case Hit.RmModel:
+                    if (recording) break;
+                    mouseView = (mouseView + 1) % 4;
+                    if (mouseView == 0) MouseDetect.Refresh();
+                    if (rmSel >= 0 && !BadgeShown(rmSel, RmModelKind()) && rmSel < 7 && BadgeX[rmSel] >= 0) rmSel = -1;
+                    SaveSettings();
+                    break;
                 case Hit.Drag:
                     Native.ReleaseCapture();
                     Native.SendMessage(Handle, 0xA1, (IntPtr)2, IntPtr.Zero); // WM_NCLBUTTONDOWN, HTCAPTION
@@ -1484,9 +1957,29 @@ namespace PurpleClicker
                 StepInterval(e.Delta > 0 ? 1 : -1);
         }
 
+        protected override void OnDeactivate(EventArgs e)
+        {
+            base.OnDeactivate(e);
+            EndRecording(false);   // sonst wuerde die Aufnahme global Tasten schlucken
+        }
+
         protected override void OnKeyDown(KeyEventArgs e)
         {
             base.OnKeyDown(e);
+            if (page == 1 && !themeOpen && e.KeyCode == Keys.Escape)
+            {
+                page = 0;
+                Invalidate();
+                e.Handled = true;
+                return;
+            }
+            if (page == 1 && !themeOpen && rmSel >= 0 && (e.KeyCode == Keys.Left || e.KeyCode == Keys.Right))
+            {
+                remap.Cycle(rmSel, e.KeyCode == Keys.Right ? 1 : -1);
+                Invalidate();
+                e.Handled = true;
+                return;
+            }
             if (themeOpen && e.KeyCode == Keys.Escape)
             {
                 themeOpen = false;
@@ -1847,6 +2340,13 @@ namespace PurpleClicker
             }
 
             DrawGear(g, hover == Hit.Gear || themeOpen);
+            DrawMouseIcon(g, hover == Hit.MouseBtn);
+            if (page == 1)
+            {
+                DrawRemapPage(g);
+                if (themeOpen) DrawThemeMenu(g);
+                return;
+            }
 
             // Intervall
             Card(g, R_CardAuto, "INTERVALL");
@@ -1991,6 +2491,211 @@ namespace PurpleClicker
                 g.FillEllipse(b, cx - 3.6f, cy - 3.6f, 7.2f, 7.2f);
         }
 
+        // Maus-Symbol in der Titelleiste (oeffnet die Umbelegung)
+        void DrawMouseIcon(Graphics g, bool hot)
+        {
+            BtnShape(g, hot || page == 1 ? C_BtnHover : C_Btn, R_MouseBtn);
+            float cx = R_MouseBtn.X + R_MouseBtn.Width / 2f, cy = R_MouseBtn.Y + R_MouseBtn.Height / 2f;
+            Color c = page == 1 ? C_Accent : C_Text;
+            using (GraphicsPath p = RR(new RectangleF(cx - 6f, cy - 9f, 12f, 18f), 6f))
+            using (Pen pen = new Pen(c, 1.6f))
+            {
+                g.DrawPath(pen, p);
+                g.DrawLine(pen, cx, cy - 9f, cx, cy - 2.5f);
+                g.DrawLine(pen, cx - 6f, cy - 2.5f, cx + 6f, cy - 2.5f);
+            }
+        }
+
+        // Maus-Seite: Liste "Eingabe -> Aktion"
+        void DrawRemapPage(Graphics g)
+        {
+            bool on = remap.On;
+            Card(g, R_RmCard, "MAUS-UMBELEGUNG");
+            string hint = recording ? "Alle Tasten drücken, Rad drehen und kippen – Enter = fertig"
+                : rmNote.Length > 0 ? rmNote
+                : !on ? "Aus – die Maus verhält sich normal"
+                : (filterOn ? "Gilt nur, wenn eines der gewählten Programme im Vordergrund ist" : "Gilt in allen Programmen");
+            DrawText(g, hint, fChip, recording ? C_Accent : C_Dim, new Rectangle(R_RmCard.X + 170, R_RmCard.Y + 8, 420, 20), StringAlignment.Near);
+            Switch(g, R_RmSw, on, hover == Hit.RmSw);
+
+            // Mausbild links, Trennlinie, Liste rechts
+            int kind = RmModelKind();
+            DrawMouseModel(g, kind);
+            using (Pen sep = new Pen(C_CardLine, 1f))
+                g.DrawLine(sep, RM_LIST_X - 12, RM_Y0, RM_LIST_X - 12, RM_Y0 + Remapper.Inputs * RM_ROW - 5);
+            for (int i = 0; i < Remapper.Inputs; i++)
+                if (BadgeShown(i, kind)) DrawBadge(g, i);
+            DrawText(g, RmModelText(), fChip, hover == Hit.RmModel && !recording ? C_Text : C_Dim, R_RmModel, StringAlignment.Center);
+
+            // Aufnahme-Knopf
+            bool hr = hover == Hit.RmRec;
+            if (recording)
+            {
+                FillAccent(g, R_RmRec, RadCtl(R_RmRec.Height), hr);
+                DrawText(g, "■  Fertig (Enter)", fChip, C_OnAccent, R_RmRec, StringAlignment.Center);
+            }
+            else
+            {
+                FillRR(g, hr ? C_BtnHover : C_Btn, R_RmRec, RadCtl(R_RmRec.Height));
+                StrokeRR(g, C_CardLine, R_RmRec, RadCtl(R_RmRec.Height), 1f);
+                DrawText(g, "●  Tasten aufnehmen", fChip, C_Text, R_RmRec, StringAlignment.Center);
+            }
+            DrawText(g, rmSeenKnown ? "Tasten, die Windows nicht meldet (z. B. DPI), lassen sich nicht umbelegen"
+                                    : "„Tasten aufnehmen“ zeigt, welche Tasten deine Maus an Windows meldet",
+                fChip, C_Dim, new Rectangle(RM_LIST_X, 420, RM_PILL_X + RM_PILL_W - RM_LIST_X, 16), StringAlignment.Near);
+
+            string[] glyph = { "1", "2", "3", "4", "5", "↑", "↓", "←", "→" };
+            for (int i = 0; i < Remapper.Inputs; i++)
+            {
+                int y = RM_Y0 + i * RM_ROW;
+                int act = remap.Map[i];
+                bool changed = act != 0;
+                bool lit = rmSel == i || (hoverIdx == i && (hover == Hit.RmBadge || hover == Hit.RmRow || hover == Hit.RmPrev || hover == Hit.RmNext || hover == Hit.RmMid));
+                if (lit)
+                {
+                    Rectangle row = new Rectangle(RM_LIST_X - 2, y - 2, RM_PILL_X + RM_PILL_W - RM_LIST_X + 4, RM_H + 4);
+                    FillRR(g, rmSel == i ? Color.FromArgb(40, C_Accent) : Color.FromArgb(22, 255, 255, 255), row, 10);
+                    if (rmSel == i) StrokeRR(g, Color.FromArgb(120, C_Accent), row, 10, 1f);
+                }
+                // Nummern-Marker wie im Mausbild
+                Rectangle badge = new Rectangle(RM_LIST_X + 6, y + 4, 22, 22);
+                bool seenNow = recording && recSeen[i];
+                bool miss = !recording && rmSeenKnown && !rmSeen[i];
+                using (SolidBrush b = new SolidBrush(seenNow ? SeenGreen : changed && on ? C_Accent : C_Btn))
+                    g.FillEllipse(b, badge);
+                DrawText(g, glyph[i], fChip, seenNow ? Color.White : changed && on ? C_OnAccent : miss ? C_Dim : C_Text, badge, StringAlignment.Center);
+                DrawText(g, ShortNames[i], fChip, !on || miss ? C_Dim : C_Text, new Rectangle(RM_LIST_X + 36, y, RM_PILL_X - RM_LIST_X - 40, RM_H), StringAlignment.Near);
+                if (seenNow)
+                    DrawText(g, "✓", fBtn, SeenGreen, new Rectangle(RM_PILL_X - 30, y, 24, RM_H), StringAlignment.Center);
+                else if (miss)
+                    DrawText(g, "–", fBtn, C_Dim, new Rectangle(RM_PILL_X - 30, y, 24, RM_H), StringAlignment.Center);
+
+                Rectangle pill = new Rectangle(RM_PILL_X, y, RM_PILL_W, RM_H);
+                FillRR(g, C_Field, pill, RadCtl(RM_H));
+                StrokeRR(g, changed && on ? C_Accent : C_CardLine, pill, RadCtl(RM_H), 1f);
+                bool hp = hover == Hit.RmPrev && hoverIdx == i, hn = hover == Hit.RmNext && hoverIdx == i;
+                bool hm = hover == Hit.RmMid && hoverIdx == i;
+                DrawText(g, "‹", fGlyph, hp ? C_Text : C_Dim, new Rectangle(RM_PILL_X, y, RM_ARROW, RM_H), StringAlignment.Center);
+                DrawText(g, "›", fGlyph, hn ? C_Text : C_Dim, new Rectangle(RM_PILL_X + RM_PILL_W - RM_ARROW, y, RM_ARROW, RM_H), StringAlignment.Center);
+                DrawText(g, Remapper.ActionNames[act], fBtn, changed ? (on ? C_Accent : C_Text) : (hm ? C_Text : C_Dim),
+                    new Rectangle(RM_PILL_X + RM_ARROW, y, RM_PILL_W - 2 * RM_ARROW, RM_H), StringAlignment.Center);
+            }
+
+            FillRR(g, hover == Hit.RmReset ? C_BtnHover : C_Btn, R_Start, radStart);
+            StrokeRR(g, C_CardLine, R_Start, radStart, 1f);
+            DrawText(g, "Alle auf Standard zurücksetzen", fBtn, C_Text, R_Start, StringAlignment.Center);
+        }
+
+        static readonly Color SeenGreen = Color.FromArgb(46, 160, 90);
+
+        // Marker auf dem Mausbild: Nummer bzw. Pfeil, Akzentfarbe wenn umbelegt, Ring wenn gewaehlt
+        void DrawBadge(Graphics g, int i)
+        {
+            string[] glyph = { "1", "2", "3", "4", "5", "↑", "↓" };
+            PointF c = BadgePt(i);
+            float r = BadgeR[i];
+            bool changed = remap.On && remap.Map[i] != 0;
+            bool seenNow = recording && recSeen[i];
+            bool miss = !recording && rmSeenKnown && !rmSeen[i];
+            bool hot = hoverIdx == i && (hover == Hit.RmBadge || hover == Hit.RmRow || hover == Hit.RmPrev || hover == Hit.RmNext || hover == Hit.RmMid);
+            RectangleF rc = new RectangleF(c.X - r, c.Y - r, 2 * r, 2 * r);
+            if (rmSel == i)
+            {
+                using (Pen ring = new Pen(C_Accent, 2.2f))
+                    g.DrawEllipse(ring, c.X - r - 3.5f, c.Y - r - 3.5f, 2 * r + 7f, 2 * r + 7f);
+            }
+            using (SolidBrush b = new SolidBrush(seenNow ? SeenGreen : changed ? C_Accent : hot ? Color.FromArgb(84, 84, 98) : miss ? Color.FromArgb(18, 18, 22) : Color.FromArgb(30, 30, 36)))
+                g.FillEllipse(b, rc);
+            using (Pen o = new Pen(Color.FromArgb(miss ? 80 : 210, 255, 255, 255), 1.3f))
+                g.DrawEllipse(o, rc);
+            DrawText(g, glyph[i], fChip, seenNow ? Color.White : changed ? C_OnAccent : miss ? Color.FromArgb(120, 120, 130) : Color.White,
+                new Rectangle((int)Math.Round(c.X - r), (int)Math.Round(c.Y - r), (int)Math.Round(2 * r), (int)Math.Round(2 * r)), StringAlignment.Center);
+        }
+
+        // Foto der eigenen Maus oder gezeichnetes Standardmodell (5 oder 3 Tasten)
+        void DrawMouseModel(Graphics g, int kind)
+        {
+            GraphicsState st = g.Save();
+            g.TranslateTransform(MS_X, MS_Y);
+            g.ScaleTransform(MS_S, MS_S);
+            if (kind == 0 && mousePhoto != null)
+            {
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                g.DrawImage(mousePhoto, new RectangleF(0, 0, MS_W, MS_H));
+                g.Restore(st);
+                return;
+            }
+
+            // Koerper (rechte Haelfte als Punktliste, links gespiegelt)
+            PointF[] right = { new PointF(118, 6), new PointF(165, 14), new PointF(198, 44), new PointF(212, 95), new PointF(213, 160),
+                               new PointF(210, 230), new PointF(209, 290), new PointF(216, 335), new PointF(214, 370), new PointF(190, 392), new PointF(150, 397) };
+            List<PointF> pts = new List<PointF>(right);
+            pts.Add(new PointF(118, 399));
+            for (int k = right.Length - 1; k >= 1; k--) pts.Add(new PointF(236 - right[k].X, right[k].Y));
+            using (GraphicsPath body = new GraphicsPath())
+            {
+                body.AddClosedCurve(pts.ToArray(), 0.5f);
+                using (LinearGradientBrush fill = new LinearGradientBrush(new RectangleF(0, 0, 236, 437), Color.FromArgb(250, 250, 253), Color.FromArgb(214, 214, 226), LinearGradientMode.Vertical))
+                    g.FillPath(fill, body);
+
+                // gewaehlte Taste tint-faerben (Flaechen werden auf den Koerper beschnitten)
+                int s = rmSel >= 0 ? rmSel : -1;
+                int h2 = (hover == Hit.RmBadge || hover == Hit.RmRow) ? hoverIdx : -1;
+                GraphicsState clipSt = g.Save();
+                g.SetClip(body, CombineMode.Intersect);
+                using (SolidBrush tint = new SolidBrush(Color.FromArgb(70, C_Accent)))
+                {
+                    if (s == 0 || h2 == 0) g.FillRectangle(tint, 0, 0, 118, 182);
+                    if (s == 1 || h2 == 1) g.FillRectangle(tint, 118, 0, 118, 182);
+                }
+                g.Restore(clipSt);
+                using (Pen outline = new Pen(Color.FromArgb(70, 70, 82), 2.2f))
+                {
+                    outline.LineJoin = LineJoin.Round;
+                    g.DrawPath(outline, body);
+                    // Tastentrennung: Mittelnaht oben/unten und Bogen unter den Haupttasten
+                    using (Pen seam = new Pen(Color.FromArgb(110, 110, 124), 1.6f))
+                    {
+                        g.DrawLine(seam, 118, 8, 118, 50);
+                        g.DrawLine(seam, 118, 120, 118, 180);
+                        g.DrawBezier(seam, 27, 174, 70, 190, 166, 190, 209, 174);
+                    }
+
+                    // Mausrad
+                    RectangleF wheel = new RectangleF(104, 50, 28, 70);
+                    bool wsel = rmSel == 2 || h2 == 2;
+                    using (GraphicsPath wp = RR(wheel, 9f))
+                    {
+                        using (SolidBrush wb = new SolidBrush(wsel ? Color.FromArgb(50, 40, 80) : Color.FromArgb(30, 30, 36)))
+                            g.FillPath(wb, wp);
+                        using (Pen wo = new Pen(wsel ? C_Accent : Color.FromArgb(90, 90, 100), 1.8f)) g.DrawPath(wo, wp);
+                    }
+                    using (Pen groove = new Pen(Color.FromArgb(90, 90, 104), 1.2f))
+                        for (int gy = 60; gy < 112; gy += 7) g.DrawLine(groove, 108, gy, 128, gy);
+                    using (SolidBrush led = new SolidBrush(C_Accent))
+                        g.FillEllipse(led, 115.5f, 144f, 5f, 10f);
+
+                    // Seitentasten (nur 5-Tasten-Modell)
+                    if (kind == 1)
+                    {
+                        for (int k = 3; k <= 4; k++)
+                        {
+                            bool ssel = rmSel == k || h2 == k;
+                            RectangleF sb = new RectangleF(12, BadgeY[k] - 19, 15, 38);
+                            using (GraphicsPath sp = RR(sb, 6f))
+                            {
+                                using (SolidBrush sbr = new SolidBrush(ssel ? Color.FromArgb(200, C_Accent) : Color.FromArgb(240, 240, 246)))
+                                    g.FillPath(sbr, sp);
+                                g.DrawPath(outline, sp);
+                            }
+                        }
+                    }
+                }
+            }
+            g.Restore(st);
+        }
+
         void DrawThemeMenu(Graphics g)
         {
             FillRR(g, Color.FromArgb(18, 18, 22), R_ThemePanel, 14);
@@ -2050,6 +2755,16 @@ namespace PurpleClicker
                         case "HotCode": hotkey.Code = v; break;
                         case "FilterOn": filterOn = v != 0; break;
                         case "MultiOn": multiOn = v != 0; break;
+                        case "MouseView": mouseView = v >= 0 && v <= 3 ? v : 0; break;
+                        case "MouseSeen":
+                            if (raw.Length == Remapper.Inputs)
+                            {
+                                for (int si = 0; si < raw.Length; si++) rmSeen[si] = raw[si] == '1';
+                                rmSeenKnown = true;
+                            }
+                            break;
+                        case "RemapOn": remap.On = v != 0; break;
+                        case "Remap": remap.Load(raw); break;
                         case "MulHotMouse": mulKey.IsMouse = v != 0; break;
                         case "MulHotCode": mulKey.Code = v; break;
                         case "Multi": multiplier = Math.Min(Math.Max(v, 1), 10); break;
@@ -2085,6 +2800,10 @@ namespace PurpleClicker
                     "HotCode=" + hotkey.Code,
                     "FilterOn=" + (filterOn ? 1 : 0),
                     "MultiOn=" + (multiOn ? 1 : 0),
+                    "MouseView=" + mouseView,
+                    "MouseSeen=" + SeenString(),
+                    "RemapOn=" + (remap.On ? 1 : 0),
+                    "Remap=" + remap.Serialize(),
                     "MulHotMouse=" + (mulKey.IsMouse ? 1 : 0),
                     "MulHotCode=" + mulKey.Code,
                     "Multi=" + multiplier,
@@ -2111,6 +2830,18 @@ namespace PurpleClicker
                 multiOn = true;
                 multiplier = 10;
                 mulKey = new Hotkey(true, 5);
+                remap.On = true;
+                remap.Map[5] = 1;   // Rad hoch -> Linksklick
+                remap.Map[3] = 9;   // Maus 4 -> Deaktiviert
+                remap.Map[2] = 8;   // Mausrad-Klick -> Doppelklick
+                page = snapPage;
+                if (snapRec == 1) { recording = true; recSeen[0] = recSeen[2] = recSeen[3] = recSeen[5] = true; }
+                if (snapRec == 2)
+                {
+                    rmSeenKnown = true;
+                    for (int ri = 0; ri < 7; ri++) rmSeen[ri] = true;
+                    rmNote = "Erkannt: 5 Tasten + Rad";
+                }
                 popupOpen = !snapThemePop;
                 themeOpen = snapThemePop;
                 popItems = new List<ProcItem>();
@@ -2163,6 +2894,9 @@ namespace PurpleClicker
                 else if (args[i] == "--demo") demo = true;
                 else if (args[i] == "--theme" && i + 1 < args.Length) { int tn; int.TryParse(args[++i], out tn); MainForm.themeArg = tn; }
                 else if (args[i] == "--themepop") MainForm.snapThemePop = true;
+                else if (args[i] == "--rec" && i + 1 < args.Length) { int rn; int.TryParse(args[++i], out rn); MainForm.snapRec = rn; }
+                else if (args[i] == "--view" && i + 1 < args.Length) { int vn; int.TryParse(args[++i], out vn); MainForm.snapView = vn; }
+                else if (args[i] == "--page" && i + 1 < args.Length) { int pn; int.TryParse(args[++i], out pn); MainForm.snapPage = pn; }
             }
 
             bool created;
