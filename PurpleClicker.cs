@@ -506,27 +506,28 @@ namespace PurpleClicker
         static readonly Rectangle R_Min = new Rectangle(612, 13, 30, 30);
         static readonly Rectangle R_Close = new Rectangle(650, 13, 30, 30);
 
-        static readonly Rectangle R_CardInt = new Rectangle(20, 64, 330, 118);
-        static readonly Rectangle R_Minus = new Rectangle(34, 96, 36, 36);
-        static readonly Rectangle R_Plus = new Rectangle(300, 96, 36, 36);
-        static readonly Rectangle R_Num = new Rectangle(76, 92, 218, 44);
-        static readonly Rectangle R_Slider = new Rectangle(26, 148, 318, 20);
-        const int SL_X = 34, SL_W = 302, SL_Y = 158;
+        // Eine Box fuer alles rund um den Autoclicker: links Intervall, rechts Maustaste / Klick-Art / Hotkey
+        static readonly Rectangle R_CardAuto = new Rectangle(20, 64, 660, 186);
+        static readonly Rectangle R_CardInt = new Rectangle(20, 64, 338, 186);   // linke Haelfte (Mausrad aendert das Intervall)
+        const int AUTO_DIV_X = 358, AUTO_LBL_X = 382, AUTO_LBL_W = 96;
+        static readonly Rectangle R_Minus = new Rectangle(34, 122, 36, 36);
+        static readonly Rectangle R_Plus = new Rectangle(300, 122, 36, 36);
+        static readonly Rectangle R_Num = new Rectangle(76, 118, 218, 44);
+        static readonly Rectangle R_Slider = new Rectangle(26, 174, 318, 20);
+        const int SL_X = 34, SL_W = 302, SL_Y = 184;
 
-        static readonly Rectangle R_CardBtn = new Rectangle(366, 64, 314, 56);
-        static readonly Rectangle R_BtnL = new Rectangle(482, 75, 91, 34);
-        static readonly Rectangle R_BtnR = new Rectangle(573, 75, 91, 34);
+        static readonly Rectangle R_BtnL = new Rectangle(482, 83, 91, 34);
+        static readonly Rectangle R_BtnR = new Rectangle(573, 83, 91, 34);
 
-        static readonly Rectangle R_CardClk = new Rectangle(366, 126, 314, 56);
-        static readonly Rectangle R_ClkS = new Rectangle(482, 137, 91, 34);
-        static readonly Rectangle R_ClkD = new Rectangle(573, 137, 91, 34);
+        static readonly Rectangle R_ClkS = new Rectangle(482, 140, 91, 34);
+        static readonly Rectangle R_ClkD = new Rectangle(573, 140, 91, 34);
 
-        static readonly Rectangle R_CardHot = new Rectangle(20, 194, 330, 56);
-        static readonly Rectangle R_HotPill = new Rectangle(104, 205, 230, 34);
-        static readonly Rectangle R_HotBtn = new Rectangle(254, 208, 76, 28);
+        static readonly Rectangle R_HotPill = new Rectangle(446, 197, 218, 34);
+        static readonly Rectangle R_HotBtn = new Rectangle(582, 200, 76, 28);
 
-        static readonly Rectangle R_CardSys = new Rectangle(366, 194, 314, 56);
-        static readonly Rectangle R_AutoSw = new Rectangle(620, 210, 44, 24);
+        // Autostart sitzt in der Titelleiste
+        static readonly Rectangle R_AutoHit = new Rectangle(404, 13, 158, 30);
+        static readonly Rectangle R_AutoSw = new Rectangle(516, 16, 44, 24);
 
         static readonly Rectangle R_CardMul = new Rectangle(20, 262, 420, 56);
         static readonly Rectangle R_MulSlider = new Rectangle(140, 268, 116, 44);
@@ -1266,6 +1267,7 @@ namespace PurpleClicker
                 }
                 return Hit.ThemeOutside;
             }
+            if (!popupOpen && R_AutoHit.Contains(p)) return Hit.AutoSw;
             if (R_Title.Contains(p)) return Hit.Drag;
 
             if (popupOpen)
@@ -1292,7 +1294,6 @@ namespace PurpleClicker
             if (R_ClkS.Contains(p)) return Hit.ClkSingle;
             if (R_ClkD.Contains(p)) return Hit.ClkDouble;
             if (R_HotBtn.Contains(p)) return Hit.HotChange;
-            if (R_CardSys.Contains(p)) return Hit.AutoSw;
             if (R_FilterSw.Contains(p)) return Hit.FilterSw;
             for (int i = 0; i < chipRects.Count; i++)
             {
@@ -1848,7 +1849,9 @@ namespace PurpleClicker
             DrawGear(g, hover == Hit.Gear || themeOpen);
 
             // Intervall
-            Card(g, R_CardInt, "INTERVALL");
+            Card(g, R_CardAuto, "INTERVALL");
+            using (Pen pen = new Pen(C_CardLine, 1f))
+                g.DrawLine(pen, AUTO_DIV_X, R_CardAuto.Y + 18, AUTO_DIV_X, R_CardAuto.Bottom - 18);
             RoundBtn(g, R_Minus, hover == Hit.Minus, "−");
             RoundBtn(g, R_Plus, hover == Hit.Plus, "+");
 
@@ -1872,30 +1875,29 @@ namespace PurpleClicker
             Thumb(g, Color.White, C_Accent, tx, SL_Y, 16, 2f);
 
             // Maustaste / Klick-Art
-            CardInline(g, R_CardBtn, "MAUSTASTE");
+            DrawText(g, "MAUSTASTE", fLabel, C_Dim, new Rectangle(AUTO_LBL_X, R_BtnL.Y, AUTO_LBL_W, R_BtnL.Height), StringAlignment.Near);
             Segment(g, R_BtnL, R_BtnR, "Links", "Rechts", clicker.Right, Hit.BtnLeft, Hit.BtnRight);
-            CardInline(g, R_CardClk, "KLICK-ART");
+            DrawText(g, "KLICK-ART", fLabel, C_Dim, new Rectangle(AUTO_LBL_X, R_ClkS.Y, AUTO_LBL_W, R_ClkS.Height), StringAlignment.Near);
             Segment(g, R_ClkS, R_ClkD, "Single", "Double", clicker.Double, Hit.ClkSingle, Hit.ClkDouble);
 
             // Hotkey
-            CardInline(g, R_CardHot, "HOTKEY");
+            DrawText(g, "HOTKEY", fLabel, C_Dim, new Rectangle(AUTO_LBL_X, R_HotPill.Y, AUTO_LBL_W, R_HotPill.Height), StringAlignment.Near);
             FillRR(g, C_Field, R_HotPill, RadCtl(R_HotPill.Height));
             bool capMain = capturing && capTarget == 0;
             bool capMul = capturing && capTarget == 1;
             StrokeRR(g, capMain ? C_Accent : C_CardLine, R_HotPill, RadCtl(R_HotPill.Height), capMain ? 1.5f : 1f);
             if (capMain)
                 DrawText(g, "Taste drücken…", fBtn, C_Accent,
-                    new Rectangle(R_HotPill.X + 16, R_HotPill.Y, 128, R_HotPill.Height), StringAlignment.Near);
+                    new Rectangle(R_HotPill.X + 16, R_HotPill.Y, 118, R_HotPill.Height), StringAlignment.Near);
             else
                 DrawText(g, hotkey.Name(), fBtn, C_Text,
-                    new Rectangle(R_HotPill.X + 16, R_HotPill.Y, 128, R_HotPill.Height), StringAlignment.Near);
+                    new Rectangle(R_HotPill.X + 16, R_HotPill.Y, 118, R_HotPill.Height), StringAlignment.Near);
             FillRR(g, hover == Hit.HotChange ? C_BtnHover : C_Btn, R_HotBtn, RadCtl(R_HotBtn.Height));
             DrawText(g, capMain ? "Abbruch" : "Ändern", fBtn, C_Text, R_HotBtn, StringAlignment.Center);
 
-            // System: Autostart
-            CardInline(g, R_CardSys, "AUTOSTART");
-            DrawText(g, "Mit Windows starten", fChip, autostart ? C_Text : C_Dim,
-                new Rectangle(R_CardSys.X + 100, R_CardSys.Y, 200, R_CardSys.Height), StringAlignment.Near);
+            // Autostart (Titelleiste): mit Windows starten
+            DrawText(g, "Autostart", fChip, autostart ? C_Text : C_Dim,
+                new Rectangle(R_AutoHit.X, R_AutoHit.Y, R_AutoSw.X - R_AutoHit.X - 8, R_AutoHit.Height), StringAlignment.Far);
             Switch(g, R_AutoSw, autostart, hover == Hit.AutoSw);
 
             // Multiplikator: 1 echter Klick = N Klicks
