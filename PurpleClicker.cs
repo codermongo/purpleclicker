@@ -324,7 +324,62 @@ namespace PurpleClicker
         readonly int[] held = new int[6];     // Aktion, die zur gerade gedrueckten Taste 1..5 gehoert (0 = keine)
         readonly int[] wheelAcc = new int[Inputs];
 
-        public Remapper() { Send = SendMouse; }
+        // SendInput darf nicht im Hook-Thread laufen: die eingespeisten Ereignisse laufen wieder durch unseren eigenen
+        // Hook, der Thread wuerde sich selbst blockieren (Fenster reagiert nicht mehr). Darum eigener Sende-Thread.
+        readonly Queue<ulong> outQ = new Queue<ulong>();
+        readonly AutoResetEvent outEv = new AutoResetEvent(false);
+        Thread outThread;
+
+        public Remapper() { Send = Post; }
+
+        void Post(uint flags, uint data)
+        {
+            lock (outQ)
+            {
+                outQ.Enqueue(((ulong)flags << 32) | data);
+                if (outThread == null)
+                {
+                    outThread = new Thread(OutLoop);
+                    outThread.IsBackground = true;
+                    outThread.Priority = ThreadPriority.AboveNormal;
+                    outThread.Start();
+                }
+            }
+            outEv.Set();
+        }
+
+        void OutLoop()
+        {
+            while (true)
+            {
+                outEv.WaitOne();
+                while (true)
+                {
+                    ulong v;
+                    lock (outQ)
+                    {
+                        if (outQ.Count == 0) break;
+                        v = outQ.Dequeue();
+                    }
+                    SendMouse((uint)(v >> 32), (uint)(v & 0xFFFFFFFF));
+                }
+            }
+        }
+
+        // Beim Beenden (Hooks sind schon entfernt): noch wartende Ereignisse direkt senden
+        public void Flush()
+        {
+            while (true)
+            {
+                ulong v;
+                lock (outQ)
+                {
+                    if (outQ.Count == 0) return;
+                    v = outQ.Dequeue();
+                }
+                SendMouse((uint)(v >> 32), (uint)(v & 0xFFFFFFFF));
+            }
+        }
 
         // Aktion, die der Eingabe selbst entspricht (= "Standard"), wird beim Durchschalten uebersprungen
         public static bool IsSelf(int input, int act)
@@ -1218,6 +1273,7 @@ namespace PurpleClicker
             if (mouseHook != IntPtr.Zero) Native.UnhookWindowsHookEx(mouseHook);
             if (keyHook != IntPtr.Zero) Native.UnhookWindowsHookEx(keyHook);
             mouseHook = keyHook = IntPtr.Zero;
+            remap.Flush();   // wartende Loslass-Ereignisse der Umbelegung noch senden
             if (servicesStarted) Native.timeEndPeriod(1);
         }
 
