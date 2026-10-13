@@ -783,7 +783,7 @@ namespace PurpleClicker
         const int W = 700, H = 506;
         static readonly Rectangle R_Title = new Rectangle(0, 0, W, 56);
         static readonly Rectangle R_Gear = new Rectangle(574, 13, 30, 30);
-        static readonly Rectangle R_ThemePanel = new Rectangle(500, 50, 180, 228);
+        static readonly Rectangle R_ThemePanel = new Rectangle(500, 50, 180, 268);
         const int THEME_ROW = 40, THEME_Y0 = 62;
         static readonly Rectangle R_Min = new Rectangle(612, 13, 30, 30);
         static readonly Rectangle R_Close = new Rectangle(650, 13, 30, 30);
@@ -888,15 +888,39 @@ namespace PurpleClicker
         int theme;
         bool themeOpen;
 
-        static readonly string[] ThemeNames = { "Original", "Terminal", "Neon", "Mono", "Sunset" };
+        static readonly string[] ThemeNames = { "Original", "Terminal", "Neon", "Mono", "Sunset", "Rainbow" };
         static readonly Color[] ThemeA = {
             Color.FromArgb(124, 108, 255), Color.FromArgb(57, 255, 120), Color.FromArgb(0, 229, 255),
-            Color.FromArgb(240, 240, 240), Color.FromArgb(255, 94, 160) };
+            Color.FromArgb(240, 240, 240), Color.FromArgb(255, 94, 160), Color.FromArgb(255, 77, 77) };
         static readonly Color[] ThemeB = {
             Color.FromArgb(124, 108, 255), Color.FromArgb(57, 255, 120), Color.FromArgb(255, 43, 214),
-            Color.FromArgb(240, 240, 240), Color.FromArgb(255, 166, 77) };
+            Color.FromArgb(240, 240, 240), Color.FromArgb(255, 166, 77), Color.FromArgb(77, 160, 255) };
+        const int THEME_RAINBOW = 5;
+        static float rbPhase;   // Farbwinkel 0..360 des Rainbow-Themes, wandert per Timer
 
         static Color A(int a, Color c) { return Color.FromArgb(a, c.R, c.G, c.B); }
+
+        static Color Hsv(float h, float s, float v)
+        {
+            h = ((h % 360f) + 360f) % 360f;
+            float c = v * s, x = c * (1f - Math.Abs((h / 60f) % 2f - 1f)), m = v - c, r, g, b;
+            if (h < 60) { r = c; g = x; b = 0; }
+            else if (h < 120) { r = x; g = c; b = 0; }
+            else if (h < 180) { r = 0; g = c; b = x; }
+            else if (h < 240) { r = 0; g = x; b = c; }
+            else if (h < 300) { r = x; g = 0; b = c; }
+            else { r = c; g = 0; b = x; }
+            return Color.FromArgb((int)((r + m) * 255f), (int)((g + m) * 255f), (int)((b + m) * 255f));
+        }
+
+        // Rainbow: Akzentfarben aus dem aktuellen Farbwinkel setzen
+        static void RainbowColors()
+        {
+            C_Accent = Hsv(rbPhase, 0.68f, 1f);
+            C_Accent2 = Hsv(rbPhase + 100f, 0.68f, 1f);
+            C_AccentHover = Lighten(C_Accent, 0.2f);
+            C_CardLine = Color.FromArgb(30 + (int)((C_Accent.R - 30) * 0.22f), 30 + (int)((C_Accent.G - 30) * 0.22f), 30 + (int)((C_Accent.B - 30) * 0.22f));
+        }
 
         public static void ApplyTheme(int n)
         {
@@ -972,7 +996,7 @@ namespace PurpleClicker
                     startGlow = false;
                     famBig = "Segoe UI Semilight";
                     break;
-                case 4: // Sunset: gross, rund, warm, Glut im Hintergrund
+                case 4: // Sunset: eckig, warm, Glut im Hintergrund
                     C_Accent = ThemeA[4]; C_Accent2 = ThemeB[4];
                     C_AccentHover = Color.FromArgb(255, 130, 185);
                     C_Card = Color.FromArgb(26, 15, 20);
@@ -982,9 +1006,20 @@ namespace PurpleClicker
                     C_BtnHover = Color.FromArgb(68, 40, 50);
                     C_Text = Color.FromArgb(255, 238, 232);
                     C_Dim = Color.FromArgb(160, 118, 126);
-                    radCard = 24; radCtl = -1; radStart = 21;
+                    radCard = 3; radCtl = 2; radStart = 3;
+                    squareThumb = true;
                     backdrop = 5;
                     famBtn = "Segoe UI Black"; famBig = "Segoe UI";
+                    break;
+                case THEME_RAINBOW: // Rainbow: Regenbogen-Verlauf, Farben wandern langsam durch
+                    C_OnAccent = Color.FromArgb(12, 12, 18);
+                    C_Thumb = C_OnAccent;
+                    C_Card = Color.FromArgb(16, 16, 20);
+                    C_Btn = Color.FromArgb(28, 28, 34);
+                    C_BtnHover = Color.FromArgb(46, 46, 56);
+                    radCard = 14; radCtl = -1; radStart = 21;
+                    famBtn = "Segoe UI Black";
+                    RainbowColors();
                     break;
             }
         }
@@ -1076,6 +1111,7 @@ namespace PurpleClicker
         readonly List<Rectangle> chipRects = new List<Rectangle>();
         Rectangle addRect = Rectangle.Empty;
         readonly System.Windows.Forms.Timer fgTimer = new System.Windows.Forms.Timer();
+        readonly System.Windows.Forms.Timer rainbowTimer = new System.Windows.Forms.Timer();
         NotifyIcon notify;
         bool startHidden;
         bool exiting;
@@ -1112,6 +1148,15 @@ namespace PurpleClicker
             };
             fgTimer.Interval = 250;
             fgTimer.Tick += delegate { ForegroundTick(); };
+            rainbowTimer.Interval = 70;
+            rainbowTimer.Tick += delegate
+            {
+                // nur animieren, solange das Fenster sichtbar ist (im Tray kostet es nichts)
+                if (!Visible || WindowState == FormWindowState.Minimized) return;
+                rbPhase = (rbPhase + 2.2f) % 360f;
+                RainbowColors();
+                Invalidate();
+            };
 
             remap.OnClick = delegate(int b)
             {
@@ -1127,6 +1172,7 @@ namespace PurpleClicker
             theme = Math.Min(Math.Max(theme, 0), ThemeNames.Length - 1);
             ApplyTheme(theme);
             BuildFonts();
+            rainbowTimer.Enabled = theme == THEME_RAINBOW && !noServices;
             autostart = GetAutostart();
             ApplyToClicker();
         }
@@ -1264,6 +1310,7 @@ namespace PurpleClicker
             exiting = true;
             SaveSettings();
             fgTimer.Stop();
+            rainbowTimer.Stop();
             clicker.SetRunning(false);
             clicker.Dispose();
             remap.On = false;
@@ -1865,6 +1912,7 @@ namespace PurpleClicker
                         theme = idx;
                         ApplyTheme(theme);
                         BuildFonts();
+                        rainbowTimer.Enabled = theme == THEME_RAINBOW;
                         SaveSettings();
                     }
                     break;
@@ -2761,10 +2809,19 @@ namespace PurpleClicker
                 Rectangle r = new Rectangle(R_ThemePanel.X + 8, THEME_Y0 + i * THEME_ROW, R_ThemePanel.Width - 16, THEME_ROW - 4);
                 bool sel = i == theme;
                 bool hot = hover == Hit.ThemeItem && hoverIdx == i;
-                if (sel) FillRR(g, Color.FromArgb(40, ThemeA[i]), r, 10);
+                Color selCol = i == THEME_RAINBOW ? C_Accent : ThemeA[i];
+                if (sel) FillRR(g, Color.FromArgb(40, selCol), r, 10);
                 else if (hot) FillRR(g, C_BtnHover, r, 10);
                 Rectangle sw = new Rectangle(r.X + 12, r.Y + (r.Height - 18) / 2, 18, 18);
-                if (i == 0)
+                if (i == THEME_RAINBOW)
+                {
+                    Color[] wheel = { Color.FromArgb(255, 94, 94), Color.FromArgb(255, 200, 70), Color.FromArgb(90, 240, 120),
+                                      Color.FromArgb(70, 210, 255), Color.FromArgb(110, 120, 255), Color.FromArgb(230, 90, 255) };
+                    for (int k = 0; k < wheel.Length; k++)
+                        using (SolidBrush b = new SolidBrush(wheel[k]))
+                            g.FillPie(b, sw.X, sw.Y, sw.Width, sw.Height, -90 + k * 60, 60);
+                }
+                else if (i == 0)
                 {
                     using (SolidBrush b = new SolidBrush(ThemeA[0])) g.FillEllipse(b, sw);
                 }
@@ -2776,7 +2833,7 @@ namespace PurpleClicker
                 DrawText(g, ThemeNames[i], fBtn, sel || hot ? C_Text : C_Dim, new Rectangle(r.X + 40, r.Y, 90, r.Height), StringAlignment.Near);
                 if (sel)
                 {
-                    using (Pen pen = new Pen(ThemeA[i], 2f))
+                    using (Pen pen = new Pen(selCol, 2f))
                     {
                         pen.StartCap = LineCap.Round;
                         pen.EndCap = LineCap.Round;
