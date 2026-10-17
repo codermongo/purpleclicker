@@ -3,7 +3,7 @@
 Kleiner Autoclicker für Windows mit AMOLED-Oberfläche, gebaut in C# (WinForms), eine einzige `.cs`-Datei.
 
 - Download: https://netpurple.net/data/PurpleClicker.exe
-- Beschreibung (Englisch): https://docu.netpurple.net/blog/purple-clicker
+- Beschreibung (Englisch): https://docu.netpurple.net/docs/PurpleClicker/purple-clicker
 
 ## Funktionen
 - Globaler Hotkey (Taste oder Maustaste 1–5, wird blockiert) als Toggle, funktioniert auch in anderen Programmen

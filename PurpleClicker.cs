@@ -1197,7 +1197,7 @@ namespace PurpleClicker
         const int THEME_ROW = 40, THEME_Y0 = 62;
         // Links neben dem Titel; Rechtecke werden beim Zeichnen anhand der Textbreite gesetzt
         Rectangle linkDocRect = Rectangle.Empty, linkRepoRect = Rectangle.Empty;
-        const string DocUrl = "https://docu.netpurple.net/blog/purple-clicker";
+        const string DocUrl = "https://docu.netpurple.net/docs/PurpleClicker/purple-clicker";
         const string RepoUrl = "https://github.com/codermongo/purpleclicker";
         static readonly Rectangle R_Min = new Rectangle(612, 13, 30, 30);
         static readonly Rectangle R_Close = new Rectangle(650, 13, 30, 30);
@@ -3127,7 +3127,7 @@ namespace PurpleClicker
             using (SolidBrush b = new SolidBrush(dot))
                 g.FillEllipse(b, titleX + titleW + 12, 24, 8, 8);   // Punkt zeigt den Zustand: laeuft / bereit / wartet auf Programm
             linkDocRect = DrawTitleIcon(g, 0, (int)(titleX + titleW + 30), hover == Hit.LinkDoc);
-            linkRepoRect = DrawTitleIcon(g, 1, linkDocRect.Right + 8, hover == Hit.LinkRepo);
+            linkRepoRect = DrawTitleIcon(g, 1, linkDocRect.Right + 8, hover == Hit.LinkRepo);   // 8 px Abstand wie bei den Knoepfen rechts
 
             BtnShape(g, hover == Hit.Min ? C_BtnHover : C_Btn, R_Min);
             BtnShape(g, hover == Hit.Close ? Color.FromArgb(214, 60, 72) : C_Btn, R_Close);
@@ -3618,12 +3618,14 @@ namespace PurpleClicker
         static readonly float[] GitHubMark = {
             8f, 0f, 7.18f, 0.04f, 6.39f, 0.16f, 5.62f, 0.36f, 4.89f, 0.63f, 4.19f, 0.97f, 3.53f, 1.37f, 2.91f, 1.83f, 2.34f, 2.34f, 1.83f, 2.91f, 1.37f, 3.53f, 0.97f, 4.19f, 0.63f, 4.89f, 0.36f, 5.62f, 0.16f, 6.39f, 0.04f, 7.18f, 0f, 8f, 0.03f, 8.66f, 0.1f, 9.3f, 0.23f, 9.92f, 0.41f, 10.53f, 0.63f, 11.12f, 0.89f, 11.68f, 1.54f, 12.73f, 2.34f, 13.66f, 3.27f, 14.45f, 4.32f, 15.1f, 4.88f, 15.37f, 5.47f, 15.59f, 5.72f, 15.59f, 5.89f, 15.51f, 5.99f, 15.37f, 6.02f, 15.21f, 6.02f, 14.99f, 6.02f, 14.65f, 6.01f, 14.21f, 6.01f, 13.72f, 5.32f, 13.8f, 4.76f, 13.79f, 4.32f, 13.7f, 3.97f, 13.56f, 3.71f, 13.37f, 3.53f, 13.17f, 3.4f, 12.96f, 3.32f, 12.78f, 3.27f, 12.67f, 3.2f, 12.53f, 3f, 12.2f, 2.76f, 11.87f, 2.63f, 11.74f, 2.5f, 11.65f, 2.29f, 11.51f, 2.14f, 11.33f, 2.12f, 11.25f, 2.17f, 11.19f, 2.29f, 11.14f, 2.49f, 11.12f, 2.72f, 11.14f, 2.93f, 11.21f, 3.28f, 11.44f, 3.55f, 11.71f, 3.72f, 11.94f, 4.01f, 12.32f, 4.32f, 12.58f, 4.65f, 12.74f, 4.98f, 12.8f, 5.3f, 12.8f, 5.59f, 12.76f, 5.85f, 12.68f, 6.05f, 12.6f, 6.13f, 12.24f, 6.24f, 11.94f, 6.39f, 11.71f, 6.56f, 11.53f, 5.89f, 11.43f, 5.24f, 11.26f, 4.63f, 11f, 4.07f, 10.63f, 3.6f, 10.12f, 3.24f, 9.46f, 3.1f, 9.06f, 3f, 8.62f, 2.94f, 8.13f, 2.92f, 7.58f, 2.98f, 6.96f, 3.14f, 6.39f, 3.4f, 5.88f, 3.74f, 5.43f, 3.7f, 5.33f, 3.66f, 5.17f, 3.61f, 4.96f, 3.59f, 4.71f, 3.58f, 4.41f, 3.61f, 4.08f, 3.69f, 3.71f, 3.82f, 3.31f, 3.85f, 3.3f, 3.95f, 3.29f, 4.11f, 3.3f, 4.35f, 3.33f, 4.65f, 3.42f, 5.03f, 3.57f, 5.49f, 3.8f, 6.02f, 4.13f, 7.01f, 3.93f, 8.02f, 3.86f, 9.03f, 3.93f, 10.02f, 4.13f, 10.55f, 3.8f, 11.01f, 3.56f, 11.39f, 3.41f, 11.69f, 3.33f, 11.93f, 3.3f, 12.09f, 3.29f, 12.19f, 3.3f, 12.22f, 3.31f, 12.35f, 3.71f, 12.43f, 4.08f, 12.46f, 4.41f, 12.45f, 4.71f, 12.43f, 4.96f, 12.38f, 5.17f, 12.34f, 5.33f, 12.3f, 5.43f, 12.64f, 5.88f, 12.9f, 6.38f, 13.06f, 6.95f, 13.12f, 7.58f, 13.1f, 8.13f, 13.04f, 8.62f, 12.94f, 9.07f, 12.8f, 9.46f, 12.43f, 10.13f, 11.96f, 10.63f, 11.41f, 11f, 10.79f, 11.26f, 10.14f, 11.43f, 9.47f, 11.53f, 9.68f, 11.76f, 9.85f, 12.08f, 9.97f, 12.5f, 10.01f, 13.01f, 10.01f, 13.77f, 10.01f, 14.41f, 10f, 14.68f, 10f, 14.9f, 10f, 15.08f, 10f, 15.21f, 10.03f, 15.37f, 10.13f, 15.51f, 10.3f, 15.59f, 10.55f, 15.59f, 11.15f, 15.36f, 11.72f, 15.09f, 12.78f, 14.42f, 13.71f, 13.61f, 14.5f, 12.67f, 15.13f, 11.62f, 15.61f, 10.48f, 15.78f, 9.88f, 15.9f, 9.27f, 15.97f, 8.64f, 16f, 8f, 15.96f, 7.18f, 15.84f, 6.39f, 15.64f, 5.62f, 15.37f, 4.89f, 15.03f, 4.19f, 14.63f, 3.53f, 14.17f, 2.91f, 13.66f, 2.34f, 13.09f, 1.83f, 12.47f, 1.37f, 11.81f, 0.97f, 11.11f, 0.63f, 10.38f, 0.36f, 9.61f, 0.16f, 8.82f, 0.04f, 8f, 0f };
 
-        // Symbol-Link in der Titelleiste (0 = Doku, 1 = GitHub); liefert das Rechteck fuer die Treffererkennung
+        // Link-Knopf in der Titelleiste (0 = Doku, 1 = GitHub), gleiche Form wie Maus- und Farbrad-Knopf;
+        // liefert das Rechteck fuer die Treffererkennung
         Rectangle DrawTitleIcon(Graphics g, int kind, int x, bool hot)
         {
-            Rectangle r = new Rectangle(x, 17, 22, 22);
-            Color c = hot ? C_Accent : C_Dim;
-            float ox = r.X + 2, oy = r.Y + 2;
+            Rectangle r = new Rectangle(x, 13, 30, 30);
+            BtnShape(g, hot ? C_BtnHover : C_Btn, r);
+            Color c = C_Text;
+            float ox = r.X + 6, oy = r.Y + 6;   // 18 x 18 Symbol mittig
             if (kind == 1)
             {
                 const float s = 18f / 16f;
