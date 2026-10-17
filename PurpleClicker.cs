@@ -11,6 +11,7 @@ using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
+using Microsoft.Win32.SafeHandles;
 
 namespace PurpleClicker
 {
@@ -233,13 +234,18 @@ namespace PurpleClicker
             while (!quit)
             {
                 burstEvent.WaitOne();
-                Thread.Sleep(15); // echtes Loslassen zuerst durchlassen
-                while (!quit && Interlocked.Add(ref pendingBurst, -1) >= 0)
+                Native.timeBeginPeriod(1);   // genaue Abstaende nur waehrend der Klickfolge
+                try
                 {
-                    Click();
-                    Thread.Sleep(BurstGapMs);
+                    Thread.Sleep(15); // echtes Loslassen zuerst durchlassen
+                    while (!quit && Interlocked.Add(ref pendingBurst, -1) >= 0)
+                    {
+                        Click();
+                        Thread.Sleep(BurstGapMs);
+                    }
+                    Interlocked.Exchange(ref pendingBurst, 0);
                 }
-                Interlocked.Exchange(ref pendingBurst, 0);
+                finally { Native.timeEndPeriod(1); }
             }
         }
 
@@ -266,24 +272,33 @@ namespace PurpleClicker
                 if (quit) break;
                 if (!running) continue;
 
-                sw.Reset();
-                sw.Start();
-                Click();
-                if (Double)
+                // 1-ms-Zeitaufloesung von Windows nur anfordern, solange geklickt wird (spart sonst Strom)
+                Native.timeBeginPeriod(1);
+                try
                 {
-                    Thread.Sleep(10);
-                    if (!running) continue;
-                    Click();
-                }
+                    while (running && !quit)
+                    {
+                        sw.Reset();
+                        sw.Start();
+                        Click();
+                        if (Double)
+                        {
+                            Thread.Sleep(10);
+                            if (!running) break;
+                            Click();
+                        }
 
-                while (running && !quit)
-                {
-                    double rem = IntervalMs - sw.Elapsed.TotalMilliseconds;
-                    if (rem <= 0) break;
-                    if (rem > 20) Thread.Sleep(10);
-                    else if (rem > 2) Thread.Sleep(1);
-                    else Thread.Yield();
+                        while (running && !quit)
+                        {
+                            double rem = IntervalMs - sw.Elapsed.TotalMilliseconds;
+                            if (rem <= 0) break;
+                            if (rem > 20) Thread.Sleep(10);
+                            else if (rem > 2) Thread.Sleep(1);
+                            else Thread.Yield();
+                        }
+                    }
                 }
+                finally { Native.timeEndPeriod(1); }
             }
         }
 
@@ -533,7 +548,7 @@ namespace PurpleClicker
         [DllImport("user32.dll")] static extern uint GetRawInputDeviceInfo(IntPtr h, uint cmd, ref RID_DEVICE_INFO data, ref uint size);
 
         // bekannte Mäuse mit eigenem Foto: Geräte-Kennung -> Name der eingebetteten Bilddatei
-        static readonly string[] KnownIds = { "VID_0B05&PID_1ACE" };
+        static readonly string[] KnownIds = { "VID_1D57&PID_FA60" };   // Attack Shark X3 (Funk-Dongle)
         static readonly string[] KnownPhotos = { "mouse-photo.png" };
 
         public static bool Found;       // mindestens eine Maus gefunden
@@ -581,6 +596,351 @@ namespace PurpleClicker
         }
     }
 
+    // ------------------------------------------------------------------ Akku
+    enum DevKind { Headset, Mouse, Keyboard }
+
+    struct BattReading
+    {
+        public bool Ok;          // Geraet hat einen gueltigen Wert geliefert
+        public int Percent;      // 1-100
+        public bool Charging;
+    }
+
+    class BattDev
+    {
+        public string Name;
+        public DevKind Kind;
+        public bool Coarse;                  // meldet nur 10-%-Schritte
+        public Func<BattReading> Query;
+        // Zustand fuer Anzeige und Meldungen (nur im UI-Thread benutzt)
+        public bool Polled;                  // mindestens einmal abgefragt
+        public bool Online;                  // letzte Abfrage hatte einen Wert
+        public bool Known;                   // es gab schon einen gueltigen Wert
+        public BattReading Last;
+        public int LastSeen;                 // TickCount des letzten gueltigen Werts
+        public readonly List<int> Announced = new List<int>();   // in dieser Entladung schon gemeldete Stufen
+        public bool FullShown;
+    }
+
+    // Liest den Akkustand der Funkgeraete direkt ueber HID, ohne Herstellersoftware.
+    // Es werden nur Lese-Befehle gesendet; jede Ein-/Ausgabe hat einen Timeout.
+    static class Battery
+    {
+        [DllImport("hid.dll")] static extern void HidD_GetHidGuid(out Guid g);
+        [DllImport("hid.dll")] static extern bool HidD_GetPreparsedData(SafeFileHandle h, out IntPtr p);
+        [DllImport("hid.dll")] static extern bool HidD_FreePreparsedData(IntPtr p);
+        [DllImport("hid.dll")] static extern int HidP_GetCaps(IntPtr p, out HIDP_CAPS c);
+        [DllImport("setupapi.dll", CharSet = CharSet.Unicode)] static extern IntPtr SetupDiGetClassDevs(ref Guid g, string e, IntPtr w, int f);
+        [DllImport("setupapi.dll")] static extern bool SetupDiEnumDeviceInterfaces(IntPtr s, IntPtr d, ref Guid g, int i, ref SP_DEVICE_INTERFACE_DATA data);
+        [DllImport("setupapi.dll", CharSet = CharSet.Unicode)] static extern bool SetupDiGetDeviceInterfaceDetail(IntPtr s, ref SP_DEVICE_INTERFACE_DATA d, IntPtr detail, int size, out int req, IntPtr dev);
+        [DllImport("setupapi.dll")] static extern bool SetupDiDestroyDeviceInfoList(IntPtr s);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern SafeFileHandle CreateFile(string n, uint a, uint s, IntPtr sa, uint c, uint f, IntPtr t);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool WriteFile(SafeFileHandle h, IntPtr b, int n, IntPtr w, IntPtr o);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool ReadFile(SafeFileHandle h, IntPtr b, int n, IntPtr r, IntPtr o);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetOverlappedResult(SafeFileHandle h, IntPtr o, out int n, bool wait);
+        [DllImport("kernel32.dll")] static extern bool CancelIoEx(SafeFileHandle h, IntPtr o);
+
+        [StructLayout(LayoutKind.Sequential)] struct SP_DEVICE_INTERFACE_DATA { public int cbSize; public Guid g; public int flags; public IntPtr r; }
+        [StructLayout(LayoutKind.Sequential)]
+        struct HIDP_CAPS
+        {
+            public ushort Usage, UsagePage, InLen, OutLen, FeatLen;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 17)] public ushort[] Res;
+            public ushort NLinkColl, NInBtn, NInVal, NInData, NOutBtn, NOutVal, NOutData, NFeatBtn, NFeatVal, NFeatData;
+        }
+
+        public static readonly BattDev[] Devices = {
+            new BattDev { Name = "Corsair HS80 MAX", Kind = DevKind.Headset, Query = QueryCorsair },
+            new BattDev { Name = "ROG Strix Scope II 96", Kind = DevKind.Keyboard, Query = QueryRog },
+            new BattDev { Name = "Attack Shark X3", Kind = DevKind.Mouse, Coarse = true, Query = QueryShark },
+        };
+
+        public static volatile bool Fast;      // beim Hochfahren alle 5 s statt alle 60 s
+        public static bool Sim;                // --battery-sim: erfundene Werte im Sekundentakt
+        static volatile bool stop;
+        static int pokeAt;
+        static readonly AutoResetEvent wake = new AutoResetEvent(false);
+        static Action<BattDev, BattReading> onReading;
+
+        // Hintergrund-Thread: fragt alle Geraete ab und meldet jedes Ergebnis (aus dem Thread heraus)
+        public static void Start(Action<BattDev, BattReading> cb)
+        {
+            onReading = cb;
+            Thread t = new Thread(Loop);
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        public static void Stop() { stop = true; wake.Set(); }
+
+        // Neu abfragen, z. B. nach dem An-/Abstecken; mehrere Anstoesse kurz hintereinander zaehlen als einer
+        public static void Poke(int delayMs)
+        {
+            pokeAt = Environment.TickCount + delayMs;
+            wake.Set();
+        }
+
+        static void Loop()
+        {
+            int tick = 0;
+            while (!stop)
+            {
+                foreach (BattDev d in Devices)
+                {
+                    BattReading r;
+                    try { r = Sim ? SimQuery(d, tick) : d.Query(); }
+                    catch { r = new BattReading(); }
+                    if (stop) return;
+                    onReading(d, r);
+                }
+                tick++;
+                if (wake.WaitOne(Sim ? 1000 : Fast ? 5000 : 60000))
+                {
+                    int left;
+                    while (!stop && (left = pokeAt - Environment.TickCount) > 0) wake.WaitOne(left);
+                }
+            }
+        }
+
+        // ---- Geraete ----
+        // Corsair (Bragi-Protokoll): Eigenschaft 0x0F = Akku in Promille
+        static BattReading QueryCorsair()
+        {
+            BattReading r = new BattReading();
+            byte[] a = Transfer("vid_1b1c&pid_0a97&mi_04&col01", 0xFF42, new byte[] { 0x02, 0x09, 0x02, 0x0F }, 300,
+                delegate(byte[] x) { return x[0] == 0x01 && x[2] == 0x02; });
+            if (a == null || a[3] != 0x00) return r;
+            int permille = a[4] | (a[5] << 8);
+            if (permille <= 0 || permille > 1000) return r;
+            r.Ok = true;
+            r.Percent = Math.Max(1, (permille + 5) / 10);
+            return r;
+        }
+
+        // ASUS ROG Tastatur am Omni Receiver: 12 01 -> Byte 6 Prozent, Byte 9 laedt; FF AA = nicht erreichbar
+        static BattReading QueryRog()
+        {
+            BattReading r = new BattReading();
+            byte[] a = Transfer("vid_0b05&pid_1ace&mi_02&col02", 0xFF00, new byte[] { 0x02, 0x12, 0x01 }, 300,
+                delegate(byte[] x) { return x[0] == 0x02 && ((x[1] == 0x12 && x[2] == 0x01) || (x[1] == 0xFF && x[2] == 0xAA)); });
+            if (a == null || a[1] != 0x12 || a[6] < 1 || a[6] > 100) return r;
+            r.Ok = true;
+            r.Percent = a[6];
+            r.Charging = a[9] == 1;
+            return r;
+        }
+
+        // Attack Shark X3: nur lesen, der Dongle sendet alle 2 s "03 10 40 xx Stufe" (Stufe 1-10 = 10-100 %);
+        // deshalb laenger als einen Takt warten
+        static BattReading QueryShark()
+        {
+            BattReading r = new BattReading();
+            byte[] a = Transfer("vid_1d57&pid_fa60&mi_02&col03", 0x000A, null, 2500,
+                delegate(byte[] x) { return x[0] == 0x03 && x[1] == 0x10 && x[2] == 0x40 && x.Length > 4 && x[4] >= 1 && x[4] <= 10; });
+            if (a == null) return r;
+            r.Ok = true;
+            r.Percent = a[4] * 10;
+            return r;
+        }
+
+        // Testfolgen fuer --battery-sim: Fallen, Laden, wieder Fallen; Tastatur zwischendurch weg
+        static BattReading SimQuery(BattDev d, int t)
+        {
+            BattReading r = new BattReading();
+            r.Ok = true;
+            if (d.Kind == DevKind.Headset)
+            {
+                int[] seq = { 80, 77, 74, 66, 58, 51, 49, 41, 33, 31, 29, 30, 29, 24, 21, 19, 15, 11, 9,
+                              16, 24, 37, 52, 68, 79, 90, 97, 100, 100, 99, 96, 88, 80, 74, 70 };
+                int i = Math.Min(t, seq.Length - 1);
+                r.Percent = seq[i];
+                r.Charging = i >= 19 && i <= 28;
+            }
+            else if (d.Kind == DevKind.Mouse)
+            {
+                int[] seq = { 100, 100, 90, 80, 70, 60, 50, 50, 40, 30, 20, 10, 10, 20, 40, 60, 80, 100, 100, 90, 80, 70 };
+                r.Percent = seq[Math.Min(t, seq.Length - 1)];
+            }
+            else
+            {
+                if (t >= 6 && t < 14) r.Ok = false;          // Tastatur aus
+                r.Percent = t < 14 ? 53 : 45;                // waehrend sie aus war unter 50 gefallen
+            }
+            return r;
+        }
+
+        // ---- HID ----
+        delegate bool Match(byte[] report);
+
+        // Oeffnet die Schnittstelle, sendet optional eine Abfrage und wartet auf die passende Antwort
+        static byte[] Transfer(string part, int usagePage, byte[] cmd, int timeoutMs, Match match)
+        {
+            string path = FindPath(part, usagePage);
+            if (path == null) return null;
+            // lesen (+ schreiben), andere Programme duerfen die Schnittstelle weiter benutzen, overlapped
+            using (SafeFileHandle h = CreateFile(path, cmd != null ? 0xC0000000 : 0x80000000, 3, IntPtr.Zero, 3, 0x40000000, IntPtr.Zero))
+            {
+                if (h.IsInvalid) return null;
+                HIDP_CAPS c = Caps(h);
+                if (c.InLen == 0) return null;
+                if (cmd != null)
+                {
+                    if (c.OutLen < cmd.Length) return null;
+                    byte[] o = new byte[c.OutLen];
+                    Array.Copy(cmd, o, cmd.Length);
+                    if (!Io(h, o, true, timeoutMs)) return null;
+                }
+                int end = Environment.TickCount + timeoutMs;
+                int left;
+                while ((left = end - Environment.TickCount) > 0)
+                {
+                    byte[] buf = new byte[c.InLen];
+                    if (!Io(h, buf, false, left)) return null;
+                    if (match(buf)) return buf;
+                }
+            }
+            return null;
+        }
+
+        static HIDP_CAPS Caps(SafeFileHandle h)
+        {
+            HIDP_CAPS c = new HIDP_CAPS();
+            IntPtr pp;
+            if (!HidD_GetPreparsedData(h, out pp)) return c;
+            HidP_GetCaps(pp, out c);
+            HidD_FreePreparsedData(pp);
+            return c;
+        }
+
+        // Ein Lese- oder Schreibvorgang mit Timeout; bei Timeout abbrechen, damit nichts haengen bleibt
+        static bool Io(SafeFileHandle h, byte[] buf, bool write, int timeoutMs)
+        {
+            IntPtr mem = Marshal.AllocHGlobal(buf.Length);
+            IntPtr ov = Marshal.AllocHGlobal(64);
+            ManualResetEvent ev = new ManualResetEvent(false);
+            try
+            {
+                for (int i = 0; i < 64; i++) Marshal.WriteByte(ov, i, 0);
+                Marshal.WriteIntPtr(ov, IntPtr.Size == 8 ? 24 : 16, ev.SafeWaitHandle.DangerousGetHandle()); // OVERLAPPED.hEvent
+                if (write) Marshal.Copy(buf, 0, mem, buf.Length);
+                bool ok = write ? WriteFile(h, mem, buf.Length, IntPtr.Zero, ov) : ReadFile(h, mem, buf.Length, IntPtr.Zero, ov);
+                if (!ok && Marshal.GetLastWin32Error() != 997) return false; // 997 = ERROR_IO_PENDING
+                int n;
+                if (!ev.WaitOne(timeoutMs))
+                {
+                    CancelIoEx(h, ov);
+                    GetOverlappedResult(h, ov, out n, true);   // warten, bis der Abbruch durch ist, erst dann Speicher freigeben
+                    return false;
+                }
+                if (!GetOverlappedResult(h, ov, out n, false)) return false;
+                if (!write) Marshal.Copy(mem, buf, 0, buf.Length);
+                return true;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(mem);
+                Marshal.FreeHGlobal(ov);
+                ev.Close();
+            }
+        }
+
+        // Pfad der HID-Schnittstelle, deren Name "part" enthaelt und die die erwartete Usage-Page hat
+        static string FindPath(string part, int usagePage)
+        {
+            Guid g;
+            HidD_GetHidGuid(out g);
+            IntPtr set = SetupDiGetClassDevs(ref g, null, IntPtr.Zero, 0x12); // DIGCF_PRESENT | DIGCF_DEVICEINTERFACE
+            if (set == IntPtr.Zero || set == (IntPtr)(-1)) return null;
+            try
+            {
+                SP_DEVICE_INTERFACE_DATA d = new SP_DEVICE_INTERFACE_DATA();
+                d.cbSize = Marshal.SizeOf(d);
+                for (int i = 0; SetupDiEnumDeviceInterfaces(set, IntPtr.Zero, ref g, i, ref d); i++)
+                {
+                    int req;
+                    SetupDiGetDeviceInterfaceDetail(set, ref d, IntPtr.Zero, 0, out req, IntPtr.Zero);
+                    if (req <= 0) continue;
+                    IntPtr det = Marshal.AllocHGlobal(req);
+                    string path = null;
+                    try
+                    {
+                        Marshal.WriteInt32(det, IntPtr.Size == 8 ? 8 : 6);   // cbSize von SP_DEVICE_INTERFACE_DETAIL_DATA
+                        if (SetupDiGetDeviceInterfaceDetail(set, ref d, det, req, out req, IntPtr.Zero))
+                            path = Marshal.PtrToStringUni(new IntPtr(det.ToInt64() + 4));
+                    }
+                    finally { Marshal.FreeHGlobal(det); }
+                    if (path == null || path.ToLowerInvariant().IndexOf(part) < 0) continue;
+                    // Zugriff 0 reicht, um die Usage-Page zu lesen
+                    using (SafeFileHandle h = CreateFile(path, 0, 3, IntPtr.Zero, 3, 0, IntPtr.Zero))
+                    {
+                        if (h.IsInvalid) continue;
+                        if (Caps(h).UsagePage == usagePage) return path;
+                    }
+                }
+            }
+            finally { SetupDiDestroyDeviceInfoList(set); }
+            return null;
+        }
+    }
+
+    // Einfache Symbole fuer Headset, Maus und Tastatur (Overlay und Akku-Seite)
+    static class DevIcons
+    {
+        public static void Draw(Graphics g, DevKind k, RectangleF r, Color c, float lw)
+        {
+            float cx = r.X + r.Width / 2f, s = r.Width / 32f;
+            using (Pen pen = new Pen(c, lw))
+            using (SolidBrush b = new SolidBrush(c))
+            {
+                pen.StartCap = LineCap.Round;
+                pen.EndCap = LineCap.Round;
+                if (k == DevKind.Headset)
+                {
+                    // Buegel + zwei Ohrmuscheln
+                    g.DrawArc(pen, r.X + 5 * s, r.Y + 4 * s, 22 * s, 22 * s, 180, 180);
+                    g.DrawLine(pen, r.X + 5 * s, r.Y + 15 * s, r.X + 5 * s, r.Y + 19 * s);
+                    g.DrawLine(pen, r.X + 27 * s, r.Y + 15 * s, r.X + 27 * s, r.Y + 19 * s);
+                    using (GraphicsPath p = Round(new RectangleF(r.X + 3 * s, r.Y + 17 * s, 7 * s, 11 * s), 2.5f * s)) g.FillPath(b, p);
+                    using (GraphicsPath p = Round(new RectangleF(r.X + 22 * s, r.Y + 17 * s, 7 * s, 11 * s), 2.5f * s)) g.FillPath(b, p);
+                }
+                else if (k == DevKind.Mouse)
+                {
+                    using (GraphicsPath p = Round(new RectangleF(cx - 8 * s, r.Y + 3 * s, 16 * s, 26 * s), 8 * s)) g.DrawPath(pen, p);
+                    g.DrawLine(pen, cx, r.Y + 3 * s, cx, r.Y + 12 * s);
+                    g.DrawLine(pen, cx - 8 * s, r.Y + 12 * s, cx + 8 * s, r.Y + 12 * s);
+                }
+                else
+                {
+                    using (GraphicsPath p = Round(new RectangleF(r.X + 2 * s, r.Y + 8 * s, 28 * s, 17 * s), 3 * s)) g.DrawPath(pen, p);
+                    for (int row = 0; row < 2; row++)
+                        for (int col = 0; col < 5; col++)
+                            g.FillRectangle(b, r.X + (6.5f + col * 4.5f) * s, r.Y + (12 + row * 4) * s, 2.4f * s, 2.4f * s);
+                    g.DrawLine(pen, r.X + 10 * s, r.Y + 21 * s, r.X + 22 * s, r.Y + 21 * s);
+                }
+            }
+        }
+
+        static GraphicsPath Round(RectangleF r, float rad)
+        {
+            float d = Math.Min(rad * 2, Math.Min(r.Width, r.Height));
+            GraphicsPath p = new GraphicsPath();
+            p.AddArc(r.X, r.Y, d, d, 180, 90);
+            p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
+        }
+
+        // Ampelfarbe: ueber 70 gruen, 30-70 gelb, unter 30 rot
+        public static Color Level(int percent)
+        {
+            if (percent > 70) return Color.FromArgb(52, 211, 100);
+            if (percent >= 30) return Color.FromArgb(250, 204, 21);
+            return Color.FromArgb(239, 68, 68);
+        }
+    }
+
     class ProcItem
     {
         public string Exe;
@@ -614,6 +974,9 @@ namespace PurpleClicker
         static readonly Color Bg = Color.FromArgb(14, 14, 14);
         static readonly Color Green = Color.FromArgb(52, 211, 100);
         float cornerRadius = 10f; // logische Pixel; mit DWM-Rundung 8
+        bool dwmRound;
+        Color border = Green;
+        int icon = -1;            // -1 = Logo, sonst DevKind (Akku-Meldung)
 
         readonly float scale;
         readonly Bitmap logo;
@@ -660,9 +1023,9 @@ namespace PurpleClicker
             int pref = 2; // DWMWCP_ROUND
             if (Native.DwmSetWindowAttribute(Handle, 33, ref pref, 4) == 0)
             {
-                int border = 0x64D334; // Gruen (COLORREF = BGR)
+                dwmRound = true;
                 cornerRadius = 8f;
-                Native.DwmSetWindowAttribute(Handle, 34, ref border, 4);
+                ApplyBorder();
             }
             else
             {
@@ -677,14 +1040,29 @@ namespace PurpleClicker
             }
         }
 
-        public void ShowMessage(string t, string s, Screen screen, int seconds)
+        void ApplyBorder()
+        {
+            int colorref = border.R | (border.G << 8) | (border.B << 16); // COLORREF = BGR
+            Native.DwmSetWindowAttribute(Handle, 34, ref colorref, 4);
+        }
+
+        // Rahmenfarbe und Symbol (Akku-Meldungen); Standard ist gruen mit Logo
+        public void SetLook(Color c, int iconKind)
+        {
+            border = c;
+            icon = iconKind;
+            if (IsHandleCreated && dwmRound) ApplyBorder();
+        }
+
+        // slot 0 = oberster Platz (Klick-Meldung), jeder weitere Platz liegt eine Meldung tiefer
+        public void ShowMessage(string t, string s, Screen screen, int seconds, int slot = 0)
         {
             title = t;
             holdMs = Math.Max(1, seconds) * 1000;
             sub = s;
             Rectangle b = screen.Bounds;
             int margin = (int)Math.Round(20 * scale);
-            Location = new Point(b.Right - Width - margin, b.Top + margin);
+            Location = new Point(b.Right - Width - margin, b.Top + margin + slot * (int)Math.Round((H + 8) * scale));
             Opacity = 0;
             phase = 0;
             if (!Visible) Show();
@@ -723,11 +1101,11 @@ namespace PurpleClicker
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
             g.ScaleTransform(scale, scale);
-            // gruener Rahmen = "Programm erkannt"
+            // gruener Rahmen = "Programm erkannt"; bei Akku-Meldungen die Ampelfarbe
             RectangleF rf = new RectangleF(1.25f, 1.25f, W - 2.5f, H - 2.5f);
             float d = cornerRadius * 2;
             using (GraphicsPath bp = new GraphicsPath())
-            using (Pen bpen = new Pen(Green, 2.5f))
+            using (Pen bpen = new Pen(border, 2.5f))
             {
                 bp.AddArc(rf.X, rf.Y, d, d, 180, 90);
                 bp.AddArc(rf.Right - d, rf.Y, d, d, 270, 90);
@@ -736,7 +1114,9 @@ namespace PurpleClicker
                 bp.CloseFigure();
                 g.DrawPath(bpen, bp);
             }
-            if (logo != null)
+            if (icon >= 0)
+                DevIcons.Draw(g, (DevKind)icon, new RectangleF(16, 16, 32, 32), border, 2.2f);
+            else if (logo != null)
             {
                 g.InterpolationMode = InterpolationMode.HighQualityBicubic;
                 g.DrawImage(logo, new Rectangle(16, 16, 32, 32));
@@ -765,6 +1145,32 @@ namespace PurpleClicker
                 bmp.Save(path, ImageFormat.Png);
             }
         }
+
+        // Nur zum Testen des Designs: drei Akku-Meldungen untereinander (gruen, gelb, rot)
+        public void SnapshotBattery(string path)
+        {
+            IntPtr h = Handle;
+            int w = ClientSize.Width, hh = ClientSize.Height, gap = (int)Math.Round(8 * scale);
+            string[] names = { "Corsair HS80 MAX", "ROG Strix Scope II 96", "Attack Shark X3" };
+            int[] pct = { 80, 50, 20 };
+            DevKind[] kinds = { DevKind.Headset, DevKind.Keyboard, DevKind.Mouse };
+            using (Bitmap all = new Bitmap(w, hh * 3 + gap * 2))
+            {
+                using (Graphics g = Graphics.FromImage(all)) g.Clear(Color.FromArgb(40, 40, 40));
+                for (int i = 0; i < 3; i++)
+                {
+                    SetLook(DevIcons.Level(pct[i]), (int)kinds[i]);
+                    title = names[i];
+                    sub = "Akku " + pct[i] + " %";
+                    using (Bitmap bmp = new Bitmap(w, hh))
+                    {
+                        DrawToBitmap(bmp, new Rectangle(0, 0, w, hh));
+                        using (Graphics g = Graphics.FromImage(all)) g.DrawImage(bmp, 0, i * (hh + gap));
+                    }
+                }
+                all.Save(path, ImageFormat.Png);
+            }
+        }
     }
 
     enum Hit
@@ -773,7 +1179,8 @@ namespace PurpleClicker
         BtnLeft, BtnRight, ClkSingle, ClkDouble, HotChange, Start,
         AutoSw, FilterSw, MulSlider, MulSw, MulKey, DurSlider, ChipX, ChipAdd, PopItem, PopPanel, PopOutside,
         Gear, ThemeItem, ThemePanel, ThemeOutside,
-        MouseBtn, RmSw, RmPrev, RmNext, RmMid, RmReset, RmBadge, RmRow, RmModel, RmRec
+        MouseBtn, RmSw, RmPrev, RmNext, RmMid, RmReset, RmBadge, RmRow, RmModel, RmRec,
+        BattBtn, BtDropSw, BtBootSw, BtPreview
     }
 
     // ------------------------------------------------------------------ Fenster
@@ -808,8 +1215,14 @@ namespace PurpleClicker
         static readonly Rectangle R_HotBtn = new Rectangle(582, 200, 76, 28);
 
         // Autostart sitzt in der Titelleiste
-        static readonly Rectangle R_AutoHit = new Rectangle(360, 13, 158, 30);
-        static readonly Rectangle R_AutoSw = new Rectangle(474, 16, 44, 24);
+        static readonly Rectangle R_AutoHit = new Rectangle(322, 13, 158, 30);
+        static readonly Rectangle R_AutoSw = new Rectangle(436, 16, 44, 24);
+        // Akku-Seite
+        static readonly Rectangle R_BattBtn = new Rectangle(498, 13, 30, 30);
+        static readonly Rectangle R_BtCard = new Rectangle(20, 64, 660, 374);
+        const int BT_Y0 = 100, BT_ROW = 68;                                      // Geraetezeilen
+        static readonly Rectangle R_BtDropSw = new Rectangle(620, 330, 44, 24);
+        static readonly Rectangle R_BtBootSw = new Rectangle(620, 386, 44, 24);
         // Maus-Seite (Umbelegung)
         static readonly Rectangle R_MouseBtn = new Rectangle(536, 13, 30, 30);
         static readonly Rectangle R_RmCard = new Rectangle(20, 64, 660, 374);
@@ -1067,7 +1480,7 @@ namespace PurpleClicker
 
         Hotkey hotkey = new Hotkey(false, (int)Keys.F6);
         readonly Remapper remap = new Remapper();   // Maus-Umbelegung
-        int page;                                   // 0 = Hauptseite, 1 = Maus-Umbelegung
+        int page;                                   // 0 = Hauptseite, 1 = Maus-Umbelegung, 2 = Akku
         int rmSel = -1;                             // im Mausbild gewaehlte Eingabe
         int mouseView;                              // 0 Auto, 1 Foto, 2 gezeichnet (5 Tasten), 3 gezeichnet (3 Tasten)
         Bitmap mousePhoto;                          // aus der exe, null wenn nicht eingebettet
@@ -1118,9 +1531,20 @@ namespace PurpleClicker
         readonly bool noServices;
         EventWaitHandle showEvent;
 
+        // Akku-Meldungen
+        bool battDropMsg = true;          // Meldung, wenn eine Stufe unterschritten wird (und bei voll geladen)
+        bool battBootMsg = true;          // Stand aller Geraete, wenn Purple Clicker mit Windows startet
+        readonly bool bootStart;          // per Autostart (--tray) gestartet
+        bool bootPending;                 // Start-Meldung steht noch aus
+        int bootDeadline;
+        readonly List<OverlayForm> battOverlays = new List<OverlayForm>();   // Index + 1 = Platz unter der Klick-Meldung
+        static readonly int[] StepsFine = { 75, 50, 30, 20, 10 };
+        static readonly int[] StepsCoarse = { 80, 50, 30, 20, 10 };
+
         public MainForm(bool hidden, bool noServices)
         {
             this.startHidden = hidden;
+            this.bootStart = hidden;
             this.noServices = noServices;
             using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) scale = g.DpiX / 96f;
             settingsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.ini");
@@ -1221,7 +1645,6 @@ namespace PurpleClicker
 
         void StartServices()
         {
-            Native.timeBeginPeriod(1);
             mouseProc = MouseProc;
             keyProc = KeyProc;
             IntPtr mod = Native.GetModuleHandle(Process.GetCurrentProcess().MainModule.ModuleName);
@@ -1269,8 +1692,25 @@ namespace PurpleClicker
             }
             catch { }
 
-            fgTimer.Start();
+            UpdateFgTimer();
             ForegroundTick();
+
+            // Akkustand im Hintergrund abfragen; beim Hochfahren oefter, bis alle Geraete da sind
+            bootPending = bootStart && battBootMsg;
+            bootDeadline = Environment.TickCount + 45000;
+            Battery.Fast = bootPending;
+            Battery.Start(delegate(BattDev d, BattReading r)
+            {
+                try { BeginInvoke((MethodInvoker)delegate { OnBattery(d, r); }); } catch { }
+            });
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            // Geraet an-/abgesteckt (WM_DEVICECHANGE) oder PC aufgewacht (PBT_APMRESUMEAUTOMATIC): Akku neu abfragen
+            if (servicesStarted && (m.Msg == 0x0219 || (m.Msg == 0x0218 && (int)m.WParam == 0x12)))
+                Battery.Poke(2000);
         }
 
         void SetRemapOn(bool on)
@@ -1310,6 +1750,7 @@ namespace PurpleClicker
             SaveSettings();
             fgTimer.Stop();
             rainbowTimer.Stop();
+            Battery.Stop();
             clicker.SetRunning(false);
             clicker.Dispose();
             remap.On = false;
@@ -1320,13 +1761,13 @@ namespace PurpleClicker
             if (keyHook != IntPtr.Zero) Native.UnhookWindowsHookEx(keyHook);
             mouseHook = keyHook = IntPtr.Zero;
             remap.Flush();   // wartende Loslass-Ereignisse der Umbelegung noch senden
-            if (servicesStarted) Native.timeEndPeriod(1);
         }
 
         // ---------------------------------------------------------- Globale Hooks
         IntPtr MouseProc(int nCode, IntPtr wParam, IntPtr lParam)
         {
-            if (nCode >= 0)
+            // Bewegungen (bei 1000 Hz bis zu 1000 pro Sekunde) sofort weiterreichen, nur Tasten und Rad auswerten
+            if (nCode >= 0 && (int)wParam != 0x200)   // WM_MOUSEMOVE
             {
                 Native.MSLLHOOKSTRUCT s = (Native.MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.MSLLHOOKSTRUCT));
                 if ((s.flags & 1) == 0) // eigene/injizierte Klicks ignorieren
@@ -1392,6 +1833,7 @@ namespace PurpleClicker
             recStart = Environment.TickCount;
             rmNote = "";
             recording = true;
+            UpdateFgTimer();
             Invalidate();
         }
 
@@ -1399,6 +1841,7 @@ namespace PurpleClicker
         {
             if (!recording) return;
             recording = false;
+            UpdateFgTimer();
             int buttons = 0;
             for (int i = 0; i < 5; i++) if (recSeen[i]) buttons++;
             bool wheel = recSeen[5] || recSeen[6], tilt = recSeen[7] || recSeen[8];
@@ -1561,6 +2004,12 @@ namespace PurpleClicker
         }
 
         // ---------------------------------------------------------- Vordergrund-Erkennung
+        // Nur noetig fuer "Nur in Programmen" und das Zeitlimit der Tasten-Aufnahme
+        void UpdateFgTimer()
+        {
+            fgTimer.Enabled = servicesStarted && !exiting && (filterOn || recording);
+        }
+
         void ForegroundTick()
         {
             IntPtr fg = Native.GetForegroundWindow();
@@ -1609,6 +2058,117 @@ namespace PurpleClicker
                 overlay.ShowMessage("Purple Clicker aktiv", exe + " erkannt", Screen.FromHandle(fg), overlaySec);
             }
             catch { }
+        }
+
+        // ---------------------------------------------------------- Akku
+        // Ergebnis einer Abfrage (im UI-Thread): Zustand merken, ggf. melden
+        void OnBattery(BattDev d, BattReading r)
+        {
+            if (exiting) return;
+            d.Polled = true;
+            d.Online = r.Ok;
+            if (r.Ok)
+            {
+                string msg = BatteryStep(d, r);
+                d.Last = r;
+                d.Known = true;
+                d.LastSeen = Environment.TickCount;
+                if (msg != null && battDropMsg && !bootPending) ShowBattery(d, r.Percent, msg);
+            }
+            if (bootPending) CheckBoot();
+            if (Visible) Invalidate();   // Akku-Seite und Symbol in der Titelleiste
+        }
+
+        // Entscheidet, ob ein neuer Wert eine Meldung ausloest (null = keine).
+        // Gemeldet wird nur beim Fallen; Steigen (Laden) schaltet Stufen still wieder scharf.
+        static string BatteryStep(BattDev d, BattReading r)
+        {
+            int[] steps = d.Coarse ? StepsCoarse : StepsFine;
+            int p = r.Percent;
+            if (!d.Known)
+            {
+                // erster Wert nach dem Start: alles ab dem aktuellen Stand gilt als schon gemeldet
+                foreach (int s in steps) if (p <= s) d.Announced.Add(s);
+                d.FullShown = p >= 100;
+                return null;
+            }
+            // Stufe erst wieder scharf, wenn der Wert deutlich darueber liegt (kein Flattern um die Grenze)
+            int hyst = d.Coarse ? 10 : 5;
+            for (int i = d.Announced.Count - 1; i >= 0; i--)
+                if (p >= d.Announced[i] + hyst) d.Announced.RemoveAt(i);
+            string msg = null;
+            if (!r.Charging)
+            {
+                // auch wenn mehrere Stufen auf einmal unterschritten wurden: nur eine Meldung
+                bool crossed = false;
+                foreach (int s in steps)
+                    if (p <= s && !d.Announced.Contains(s)) { d.Announced.Add(s); crossed = true; }
+                if (crossed) msg = "Akku " + p + " %";
+            }
+            if (p >= 100)
+            {
+                if (!d.FullShown) { d.FullShown = true; msg = "Voll geladen · 100 %"; }
+            }
+            else if (p < 95) d.FullShown = false;
+            return msg;
+        }
+
+        // Start-Meldung: sobald alle Geraete einen Wert hatten, spaetestens nach 45 s
+        void CheckBoot()
+        {
+            bool all = true;
+            foreach (BattDev d in Battery.Devices) if (!d.Known) all = false;
+            if (!all && Environment.TickCount - bootDeadline < 0) return;
+            bootPending = false;
+            Battery.Fast = false;
+            foreach (BattDev d in Battery.Devices)
+                if (d.Online) ShowBattery(d, d.Last.Percent, "Akku " + d.Last.Percent + " %" + (d.Last.Charging ? " · lädt" : ""));
+        }
+
+        // Akku-Meldung oben rechts, unter der Klick-Meldung; mehrere stehen untereinander
+        void ShowBattery(BattDev d, int percent, string sub)
+        {
+            try
+            {
+                // sichtbare Meldung desselben Geraets aktualisieren, sonst ersten freien Platz nehmen
+                int slot = -1;
+                for (int i = 0; i < battOverlays.Count; i++)
+                    if (battOverlays[i].Visible && battOverlays[i].Tag == d) { slot = i; break; }
+                if (slot < 0)
+                    for (int i = 0; i < battOverlays.Count; i++)
+                        if (battOverlays[i].IsDisposed || !battOverlays[i].Visible) { slot = i; break; }
+                if (slot < 0) { battOverlays.Add(null); slot = battOverlays.Count - 1; }
+                OverlayForm o = battOverlays[slot];
+                if (o == null || o.IsDisposed) { o = new OverlayForm(logo, scale); battOverlays[slot] = o; }
+                o.Tag = d;
+                o.SetLook(DevIcons.Level(percent), (int)d.Kind);
+                IntPtr fg = Native.GetForegroundWindow();
+                o.ShowMessage(d.Name, sub, fg != IntPtr.Zero ? Screen.FromHandle(fg) : Screen.PrimaryScreen, overlaySec, slot + 1);
+            }
+            catch { }
+        }
+
+        // Vorschau auf der Akku-Seite: je eine Meldung in Gruen, Gelb und Rot
+        void ShowBatteryPreview()
+        {
+            int[] pct = { 80, 50, 20 };
+            for (int i = 0; i < Battery.Devices.Length; i++)
+                ShowBattery(Battery.Devices[i], pct[i], "Vorschau · Akku " + pct[i] + " %");
+        }
+
+        // Text unter dem Geraetenamen auf der Akku-Seite
+        static string BattStatus(BattDev d)
+        {
+            string kind = d.Kind == DevKind.Headset ? "Headset" : d.Kind == DevKind.Mouse ? "Maus" : "Tastatur";
+            if (!d.Polled) return kind + " · wird abgefragt …";
+            if (d.Online)
+            {
+                if (d.Last.Charging) return kind + " · lädt";
+                return kind + (d.Coarse ? " · meldet 10-%-Schritte" : " · verbunden");
+            }
+            if (!d.Known) return kind + " · nicht verbunden";
+            int min = Math.Max(0, (Environment.TickCount - d.LastSeen) / 60000);
+            return kind + " · nicht erreichbar, zuletzt vor " + (min < 1 ? "< 1" : min.ToString()) + " min";
         }
 
         // Laufende Programme mit sichtbarem Fenster
@@ -1736,8 +2296,16 @@ namespace PurpleClicker
             }
             if (page == 0 && !popupOpen && R_AutoHit.Contains(p)) return Hit.AutoSw;
             if (R_MouseBtn.Contains(p)) return Hit.MouseBtn;
+            if (R_BattBtn.Contains(p)) return Hit.BattBtn;
             if (R_Title.Contains(p)) return Hit.Drag;
             if (page == 1) return HitRemap(p);
+            if (page == 2)
+            {
+                if (R_BtDropSw.Contains(p)) return Hit.BtDropSw;
+                if (R_BtBootSw.Contains(p)) return Hit.BtBootSw;
+                if (R_Start.Contains(p)) return Hit.BtPreview;
+                return Hit.None;
+            }
 
             if (popupOpen)
             {
@@ -1923,6 +2491,16 @@ namespace PurpleClicker
                     popupOpen = false;
                     themeOpen = false;
                     break;
+                case Hit.BattBtn:
+                    EndRecording(false);
+                    page = page == 2 ? 0 : 2;
+                    if (page == 2 && servicesStarted) Battery.Poke(0);   // frische Werte holen
+                    popupOpen = false;
+                    themeOpen = false;
+                    break;
+                case Hit.BtDropSw: battDropMsg = !battDropMsg; SaveSettings(); break;
+                case Hit.BtBootSw: battBootMsg = !battBootMsg; SaveSettings(); break;
+                case Hit.BtPreview: ShowBatteryPreview(); break;
                 case Hit.RmSw: SetRemapOn(!remap.On); break;
                 case Hit.RmPrev: if (idx >= 0) remap.Cycle(idx, -1); break;
                 case Hit.RmNext:
@@ -1982,6 +2560,7 @@ namespace PurpleClicker
                     break;
                 case Hit.FilterSw:
                     filterOn = !filterOn;
+                    UpdateFgTimer();
                     ForegroundTick();
                     break;
                 case Hit.ChipX:
@@ -2001,6 +2580,7 @@ namespace PurpleClicker
                         filterOn = true; // Auswahl aktiviert den Filter
                         wasMatch = false;
                         popupOpen = false;
+                        UpdateFgTimer();
                         ForegroundTick();
                     }
                     break;
@@ -2069,7 +2649,7 @@ namespace PurpleClicker
         protected override void OnKeyDown(KeyEventArgs e)
         {
             base.OnKeyDown(e);
-            if (page == 1 && !themeOpen && e.KeyCode == Keys.Escape)
+            if ((page == 1 || page == 2) && !themeOpen && e.KeyCode == Keys.Escape)
             {
                 page = 0;
                 Invalidate();
@@ -2444,9 +3024,10 @@ namespace PurpleClicker
 
             DrawGear(g, hover == Hit.Gear || themeOpen);
             DrawMouseIcon(g, hover == Hit.MouseBtn);
-            if (page == 1)
+            DrawBattIcon(g, hover == Hit.BattBtn);
+            if (page == 1 || page == 2)
             {
-                DrawRemapPage(g);
+                if (page == 1) DrawRemapPage(g); else DrawBatteryPage(g);
                 if (themeOpen) DrawThemeMenu(g);
                 return;
             }
@@ -2607,6 +3188,73 @@ namespace PurpleClicker
                 g.DrawLine(pen, cx, cy - 9f, cx, cy - 2.5f);
                 g.DrawLine(pen, cx - 6f, cy - 2.5f, cx + 6f, cy - 2.5f);
             }
+        }
+
+        // Akku-Symbol in der Titelleiste (oeffnet die Akku-Seite); Fuellstand = schwaechstes verbundenes Geraet
+        void DrawBattIcon(Graphics g, bool hot)
+        {
+            BtnShape(g, hot || page == 2 ? C_BtnHover : C_Btn, R_BattBtn);
+            float cx = R_BattBtn.X + R_BattBtn.Width / 2f, cy = R_BattBtn.Y + R_BattBtn.Height / 2f;
+            Color c = page == 2 ? C_Accent : C_Text;
+            int low = -1;
+            foreach (BattDev d in Battery.Devices)
+                if (d.Online && (low < 0 || d.Last.Percent < low)) low = d.Last.Percent;
+            RectangleF body = new RectangleF(cx - 9f, cy - 5f, 16f, 10f);
+            using (GraphicsPath p = RR(body, 2f))
+            using (Pen pen = new Pen(c, 1.5f))
+                g.DrawPath(pen, p);
+            using (SolidBrush b = new SolidBrush(c))
+            {
+                g.FillRectangle(b, body.Right + 1f, cy - 2.5f, 2f, 5f);
+                if (low > 0) g.FillRectangle(b, body.X + 2.5f, body.Y + 2.5f, (body.Width - 5f) * low / 100f, body.Height - 5f);
+            }
+        }
+
+        // Akku-Seite: Stand der Geraete + Schalter fuer die Meldungen
+        void DrawBatteryPage(Graphics g)
+        {
+            Card(g, R_BtCard, "AKKU");
+            DrawText(g, "Wird jede Minute abgefragt, ohne Herstellersoftware", fChip, C_Dim,
+                new Rectangle(R_BtCard.X + 170, R_BtCard.Y + 8, 420, 20), StringAlignment.Near);
+
+            const int barX = 340, barW = 220;
+            for (int i = 0; i < Battery.Devices.Length; i++)
+            {
+                BattDev d = Battery.Devices[i];
+                int y = BT_Y0 + i * BT_ROW;
+                Rectangle row = new Rectangle(36, y, 628, BT_ROW - 12);
+                float rr = Math.Min(RadCtl(row.Height), 12f);
+                FillRR(g, C_Field, row, rr);
+                StrokeRR(g, C_CardLine, row, rr, 1f);
+                Color lc = d.Known ? DevIcons.Level(d.Last.Percent) : C_Dim;
+                if (!d.Online) lc = Color.FromArgb(110, lc);
+                DevIcons.Draw(g, d.Kind, new RectangleF(52, y + 12, 32, 32), d.Online ? C_Text : C_Dim, 1.8f);
+                DrawText(g, d.Name, fBtn, d.Online ? C_Text : C_Dim, new Rectangle(100, y + 8, 230, 22), StringAlignment.Near);
+                DrawText(g, BattStatus(d), fChip, C_Dim, new Rectangle(100, y + 28, 236, 20), StringAlignment.Near);
+
+                // Balken in der Ampelfarbe
+                Rectangle track = new Rectangle(barX, y + row.Height / 2 - 4, barW, 8);
+                FillRR(g, Color.FromArgb(40, 40, 40), track, 4);
+                if (d.Known)
+                    FillRR(g, lc, new Rectangle(track.X, track.Y, Math.Max(8, barW * d.Last.Percent / 100), track.Height), 4);
+                DrawText(g, d.Known ? d.Last.Percent + " %" : "–", fTitle, d.Online ? lc : C_Dim,
+                    new Rectangle(barX + barW + 8, y, 640 - barX - barW, row.Height), StringAlignment.Far);
+            }
+
+            using (Pen sep = new Pen(C_CardLine, 1f))
+                g.DrawLine(sep, 36, 314, 664, 314);
+            DrawText(g, "Meldung, wenn der Akku fällt", fBtn, C_Text, new Rectangle(40, 322, 560, 20), StringAlignment.Near);
+            DrawText(g, "Bei 75 · 50 · 30 · 20 · 10 % (Maus 80 · 50 · 30 · 20 · 10 %) und wenn ein Gerät voll geladen ist",
+                fChip, C_Dim, new Rectangle(40, 342, 570, 18), StringAlignment.Near);
+            Switch(g, R_BtDropSw, battDropMsg, hover == Hit.BtDropSw);
+            DrawText(g, "Meldung beim PC-Start", fBtn, C_Text, new Rectangle(40, 378, 560, 20), StringAlignment.Near);
+            DrawText(g, "Stand aller Geräte, wenn Purple Clicker mit Windows startet (Autostart)",
+                fChip, C_Dim, new Rectangle(40, 398, 570, 18), StringAlignment.Near);
+            Switch(g, R_BtBootSw, battBootMsg, hover == Hit.BtBootSw);
+
+            FillRR(g, hover == Hit.BtPreview ? C_BtnHover : C_Btn, R_Start, radStart);
+            StrokeRR(g, C_CardLine, R_Start, radStart, 1f);
+            DrawText(g, "Vorschau der Meldungen", fBtn, C_Text, R_Start, StringAlignment.Center);
         }
 
         // Maus-Seite: Liste "Eingabe -> Aktion"
@@ -2881,6 +3529,8 @@ namespace PurpleClicker
                         case "MulHotCode": mulKey.Code = v; break;
                         case "Multi": multiplier = Math.Min(Math.Max(v, 1), 10); break;
                         case "OverlaySec": overlaySec = Math.Min(Math.Max(v, 1), 10); break;
+                        case "BattDropMsg": battDropMsg = v != 0; break;
+                        case "BattBootMsg": battBootMsg = v != 0; break;
                         case "Theme": theme = ThemeFromSetting(raw); break;
                         case "Programs":
                             programs.Clear();
@@ -2920,6 +3570,8 @@ namespace PurpleClicker
                     "MulHotCode=" + mulKey.Code,
                     "Multi=" + multiplier,
                     "OverlaySec=" + overlaySec,
+                    "BattDropMsg=" + (battDropMsg ? 1 : 0),
+                    "BattBootMsg=" + (battBootMsg ? 1 : 0),
                     "Theme=" + ThemeNames[theme],
                     "Programs=" + string.Join(";", programs.ToArray())
                 });
@@ -2960,6 +3612,11 @@ namespace PurpleClicker
                 popItems.Add(new ProcItem("chrome.exe", "Neuer Tab - Google Chrome"));
                 popItems.Add(new ProcItem("explorer.exe", "Dieser PC"));
                 popItems.Add(new ProcItem("minecraft.exe", "Minecraft 1.21"));
+                // Akku-Seite: verbunden, laedt, nicht erreichbar
+                BattDev[] bd = Battery.Devices;
+                bd[0].Polled = bd[0].Online = bd[0].Known = true; bd[0].Last.Percent = 44;
+                bd[1].Polled = bd[1].Online = bd[1].Known = true; bd[1].Last.Percent = 83; bd[1].Last.Charging = true;
+                bd[2].Polled = bd[2].Known = true; bd[2].Last.Percent = 20; bd[2].LastSeen = Environment.TickCount - 7 * 60000;
             }
             using (Bitmap bmp = new Bitmap(ClientSize.Width, ClientSize.Height))
             {
@@ -2998,10 +3655,12 @@ namespace PurpleClicker
                     using (Graphics g0 = Graphics.FromHwnd(IntPtr.Zero)) sc = g0.DpiX / 96f;
                     Bitmap lg = null;
                     try { lg = Icon.ExtractAssociatedIcon(Application.ExecutablePath).ToBitmap(); } catch { }
-                    new OverlayForm(lg, sc).Snapshot(args[i + 1]);
+                    if (i + 2 < args.Length && args[i + 2] == "--battery") new OverlayForm(lg, sc).SnapshotBattery(args[i + 1]);
+                    else new OverlayForm(lg, sc).Snapshot(args[i + 1]);
                     return;
                 }
                 if (args[i] == "--tray") tray = true;
+                else if (args[i] == "--battery-sim") Battery.Sim = true;
                 else if (args[i] == "--snapshot" && i + 1 < args.Length) { snapshot = true; snapPath = args[++i]; }
                 else if (args[i] == "--demo") demo = true;
                 else if (args[i] == "--theme" && i + 1 < args.Length) { int tn; int.TryParse(args[++i], out tn); MainForm.themeArg = tn; }
