@@ -1540,6 +1540,7 @@ namespace PurpleClicker
         readonly List<OverlayForm> battOverlays = new List<OverlayForm>();   // Index + 1 = Platz unter der Klick-Meldung
         static readonly int[] StepsFine = { 75, 50, 30, 20, 10 };
         static readonly int[] StepsCoarse = { 80, 50, 30, 20, 10 };
+        const int BattMsgSec = 12;        // Anzeigedauer der Akku-Meldungen, unabhaengig vom Schieber "MELDUNG"
 
         public MainForm(bool hidden, bool noServices)
         {
@@ -2073,7 +2074,11 @@ namespace PurpleClicker
                 d.Last = r;
                 d.Known = true;
                 d.LastSeen = Environment.TickCount;
-                if (msg != null && battDropMsg && !bootPending) ShowBattery(d, r.Percent, msg);
+                if (msg != null && battDropMsg && !bootPending)
+                {
+                    ShowBattery(d, r.Percent, msg);
+                    BattSound(r.Percent);
+                }
             }
             if (bootPending) CheckBoot();
             if (Visible) Invalidate();   // Akku-Seite und Symbol in der Titelleiste
@@ -2143,7 +2148,7 @@ namespace PurpleClicker
                 o.Tag = d;
                 o.SetLook(DevIcons.Level(percent), (int)d.Kind);
                 IntPtr fg = Native.GetForegroundWindow();
-                o.ShowMessage(d.Name, sub, fg != IntPtr.Zero ? Screen.FromHandle(fg) : Screen.PrimaryScreen, overlaySec, slot + 1);
+                o.ShowMessage(d.Name, sub, fg != IntPtr.Zero ? Screen.FromHandle(fg) : Screen.PrimaryScreen, BattMsgSec, slot + 1);
             }
             catch { }
         }
@@ -2154,6 +2159,18 @@ namespace PurpleClicker
             int[] pct = { 80, 50, 20 };
             for (int i = 0; i < Battery.Devices.Length; i++)
                 ShowBattery(Battery.Devices[i], pct[i], "Vorschau · Akku " + pct[i] + " %");
+            BattSound(pct[pct.Length - 1]);
+        }
+
+        // Ton zur Akku-Meldung (Windows-Klangschema): unter 30 % Warnton, sonst Hinweiston
+        static void BattSound(int percent)
+        {
+            try
+            {
+                if (percent < 30) System.Media.SystemSounds.Exclamation.Play();
+                else System.Media.SystemSounds.Asterisk.Play();
+            }
+            catch { }
         }
 
         // Text unter dem Geraetenamen auf der Akku-Seite
