@@ -941,6 +941,95 @@ namespace PurpleClicker
         }
     }
 
+    // Signaltoene der Akku-Meldungen: gezupfte Saite (Karplus-Strong), im Speicher erzeugt, keine Dateien.
+    // Index 0..5 = 70, 50, 30, 20, 10 %, Voll geladen; je hoeher der Akku, desto freundlicher die Tonfolge.
+    static class BattTones
+    {
+        const int SR = 44100;
+        const double A4 = 440, C5 = 523.25, D5 = 587.33, E5 = 659.25, G5 = 783.99, A5 = 880, C6 = 1046.5;
+        // je Stand: {Start ms, Frequenz}
+        static readonly double[][][] Melody = {
+            new[] { new[] { 0.0, E5 }, new[] { 150.0, A5 } },                                   // 70: Quarte aufwaerts
+            new[] { new[] { 0.0, D5 }, new[] { 240.0, D5 } },                                   // 50: zwei gleiche Toene
+            new[] { new[] { 0.0, G5 }, new[] { 200.0, E5 } },                                   // 30: kleine Terz abwaerts
+            new[] { new[] { 0.0, E5 }, new[] { 180.0, C5 }, new[] { 360.0, A4 } },              // 20: drei Toene abwaerts
+            new[] { new[] { 0.0, E5 }, new[] { 170.0, C5 }, new[] { 560.0, E5 }, new[] { 730.0, C5 },
+                    new[] { 1120.0, E5 }, new[] { 1290.0, C5 } },                               // 10: ding-dong dreimal
+            new[] { new[] { 0.0, C5 }, new[] { 120.0, E5 }, new[] { 240.0, G5 }, new[] { 360.0, C6 } }, // Voll: Dur-Dreiklang
+        };
+        static readonly byte[][] cache = new byte[6][];
+        static System.Media.SoundPlayer player;   // Referenz halten, solange der Ton laeuft
+
+        public static void Play(int index)
+        {
+            try
+            {
+                if (index < 0 || index >= cache.Length) return;
+                if (cache[index] == null) cache[index] = Wav(index);
+                System.Media.SoundPlayer old = player;
+                player = new System.Media.SoundPlayer(new MemoryStream(cache[index]));
+                player.Play();   // asynchron; ein neuer Ton ersetzt einen laufenden
+                if (old != null) old.Dispose();
+            }
+            catch { }
+        }
+
+        static byte[] Wav(int index)
+        {
+            const double ring = 1300;
+            double[][] notes = Melody[index];
+            double[] buf = new double[(int)(SR * (notes[notes.Length - 1][0] + ring) / 1000)];
+            Random rnd = new Random(7);
+            foreach (double[] n in notes)
+            {
+                int s0 = (int)(SR * n[0] / 1000);
+                int len = Math.Min((int)(SR * ring / 1000), buf.Length - s0);
+                double[] v = Pluck(n[1], len, rnd);
+                for (int i = 0; i < len; i++) buf[s0 + i] += v[i];
+            }
+            // weiches Ende, leise und einheitliche Lautstaerke (Spitze 22 %)
+            int fade = SR / 20;
+            for (int i = 0; i < fade && i < buf.Length; i++) buf[buf.Length - 1 - i] *= (double)i / fade;
+            double peak = 0;
+            foreach (double x in buf) peak = Math.Max(peak, Math.Abs(x));
+            double gain = peak > 0 ? 0.22 / peak : 0;
+
+            MemoryStream ms = new MemoryStream();
+            BinaryWriter w = new BinaryWriter(ms);
+            w.Write(new[] { 'R', 'I', 'F', 'F' }); w.Write(36 + buf.Length * 2);
+            w.Write(new[] { 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ' });
+            w.Write(16); w.Write((short)1); w.Write((short)1); w.Write(SR); w.Write(SR * 2); w.Write((short)2); w.Write((short)16);
+            w.Write(new[] { 'd', 'a', 't', 'a' }); w.Write(buf.Length * 2);
+            foreach (double x in buf) w.Write((short)(Math.Max(-1.0, Math.Min(1.0, x * gain)) * 32767));
+            return ms.ToArray();
+        }
+
+        // Gezupfte Saite (Karplus-Strong) mit Allpass-Feinstimmung
+        static double[] Pluck(double f, int len, Random rnd)
+        {
+            double period = SR / f - 0.5;
+            int n = (int)Math.Floor(period);
+            double d = period - n, c = (1 - d) / (1 + d);
+            double[] line = new double[n];
+            double s = 0;
+            for (int i = 0; i < n; i++) { s += 0.5 * ((rnd.NextDouble() * 2 - 1) - s); line[i] = s; }   // weiches Anzupfen
+            double[] o = new double[len];
+            int p = 0;
+            double apX = 0, apY = 0;
+            for (int i = 0; i < len; i++)
+            {
+                double cur = line[p], next = line[(p + 1) % n];
+                double avg = 0.4985 * (cur + next);
+                double y = c * avg + apX - c * apY;   // Allpass fuer den Bruchteil der Verzoegerung
+                apX = avg; apY = y;
+                line[p] = y;
+                o[i] = cur;
+                p = (p + 1) % n;
+            }
+            return o;
+        }
+    }
+
     class ProcItem
     {
         public string Exe;
@@ -1180,7 +1269,7 @@ namespace PurpleClicker
         AutoSw, FilterSw, MulSlider, MulSw, MulKey, DurSlider, ChipX, ChipAdd, PopItem, PopPanel, PopOutside,
         Gear, ThemeItem, ThemePanel, ThemeOutside,
         MouseBtn, RmSw, RmPrev, RmNext, RmMid, RmReset, RmBadge, RmRow, RmModel, RmRec,
-        BattBtn, BtDropSw, BtBootSw, BtPreview
+        BattBtn, BtDropSw, BtBootSw, BtPreview, BtSoundSw, BtTone
     }
 
     // ------------------------------------------------------------------ Fenster
@@ -1220,9 +1309,12 @@ namespace PurpleClicker
         // Akku-Seite
         static readonly Rectangle R_BattBtn = new Rectangle(498, 13, 30, 30);
         static readonly Rectangle R_BtCard = new Rectangle(20, 64, 660, 374);
-        const int BT_Y0 = 100, BT_ROW = 68;                                      // Geraetezeilen
-        static readonly Rectangle R_BtDropSw = new Rectangle(620, 330, 44, 24);
-        static readonly Rectangle R_BtBootSw = new Rectangle(620, 386, 44, 24);
+        const int BT_Y0 = 96, BT_ROW = 56;                                       // Geraetezeilen
+        static readonly Rectangle R_BtDropSw = new Rectangle(620, 276, 44, 24);
+        static readonly Rectangle R_BtBootSw = new Rectangle(620, 320, 44, 24);
+        static readonly Rectangle R_BtSoundSw = new Rectangle(620, 384, 44, 24);
+        const int BT_TONE_X = 40, BT_TONE_Y = 382, BT_TONE_W = 64, BT_TONE_H = 28, BT_TONE_GAP = 8;   // Ton-Chips
+        static readonly string[] ToneNames = { "70 %", "50 %", "30 %", "20 %", "10 %", "Voll" };
         // Maus-Seite (Umbelegung)
         static readonly Rectangle R_MouseBtn = new Rectangle(536, 13, 30, 30);
         static readonly Rectangle R_RmCard = new Rectangle(20, 64, 660, 374);
@@ -1538,8 +1630,9 @@ namespace PurpleClicker
         bool bootPending;                 // Start-Meldung steht noch aus
         int bootDeadline;
         readonly List<OverlayForm> battOverlays = new List<OverlayForm>();   // Index + 1 = Platz unter der Klick-Meldung
-        static readonly int[] StepsFine = { 75, 50, 30, 20, 10 };
-        static readonly int[] StepsCoarse = { 80, 50, 30, 20, 10 };
+        bool battSoundAll = true;                                           // Hauptschalter "Alle Toene"
+        readonly bool[] battSound = { true, true, true, true, true, true }; // je Ton: 70, 50, 30, 20, 10 %, Voll
+        static readonly int[] Steps = { 70, 50, 30, 20, 10 };
         const int BattMsgSec = 12;        // Anzeigedauer der Akku-Meldungen, unabhaengig vom Schieber "MELDUNG"
 
         public MainForm(bool hidden, bool noServices)
@@ -2070,52 +2163,49 @@ namespace PurpleClicker
             d.Online = r.Ok;
             if (r.Ok)
             {
-                string msg = BatteryStep(d, r);
+                int stage = BatteryStep(d, r);
                 d.Last = r;
                 d.Known = true;
                 d.LastSeen = Environment.TickCount;
-                if (msg != null && battDropMsg && !bootPending)
+                if (stage != 0 && battDropMsg && !bootPending)
                 {
-                    ShowBattery(d, r.Percent, msg);
-                    BattSound(r.Percent);
+                    ShowBattery(d, r.Percent, stage == 100 ? "Voll geladen · 100 %" : "Akku " + r.Percent + " %");
+                    StageTone(stage);
                 }
             }
             if (bootPending) CheckBoot();
             if (Visible) Invalidate();   // Akku-Seite und Symbol in der Titelleiste
         }
 
-        // Entscheidet, ob ein neuer Wert eine Meldung ausloest (null = keine).
+        // Entscheidet, ob ein neuer Wert eine Meldung ausloest: 0 = keine, sonst die Stufe (70..10) oder 100 = voll geladen.
         // Gemeldet wird nur beim Fallen; Steigen (Laden) schaltet Stufen still wieder scharf.
-        static string BatteryStep(BattDev d, BattReading r)
+        static int BatteryStep(BattDev d, BattReading r)
         {
-            int[] steps = d.Coarse ? StepsCoarse : StepsFine;
             int p = r.Percent;
             if (!d.Known)
             {
                 // erster Wert nach dem Start: alles ab dem aktuellen Stand gilt als schon gemeldet
-                foreach (int s in steps) if (p <= s) d.Announced.Add(s);
+                foreach (int s in Steps) if (p <= s) d.Announced.Add(s);
                 d.FullShown = p >= 100;
-                return null;
+                return 0;
             }
             // Stufe erst wieder scharf, wenn der Wert deutlich darueber liegt (kein Flattern um die Grenze)
             int hyst = d.Coarse ? 10 : 5;
             for (int i = d.Announced.Count - 1; i >= 0; i--)
                 if (p >= d.Announced[i] + hyst) d.Announced.RemoveAt(i);
-            string msg = null;
+            int stage = 0;
             if (!r.Charging)
             {
-                // auch wenn mehrere Stufen auf einmal unterschritten wurden: nur eine Meldung
-                bool crossed = false;
-                foreach (int s in steps)
-                    if (p <= s && !d.Announced.Contains(s)) { d.Announced.Add(s); crossed = true; }
-                if (crossed) msg = "Akku " + p + " %";
+                // auch wenn mehrere Stufen auf einmal unterschritten wurden: nur eine Meldung, mit der niedrigsten
+                foreach (int s in Steps)
+                    if (p <= s && !d.Announced.Contains(s)) { d.Announced.Add(s); stage = s; }
             }
             if (p >= 100)
             {
-                if (!d.FullShown) { d.FullShown = true; msg = "Voll geladen · 100 %"; }
+                if (!d.FullShown) { d.FullShown = true; stage = 100; }
             }
             else if (p < 95) d.FullShown = false;
-            return msg;
+            return stage;
         }
 
         // Start-Meldung: sobald alle Geraete einen Wert hatten, spaetestens nach 45 s
@@ -2159,18 +2249,26 @@ namespace PurpleClicker
             int[] pct = { 80, 50, 20 };
             for (int i = 0; i < Battery.Devices.Length; i++)
                 ShowBattery(Battery.Devices[i], pct[i], "Vorschau · Akku " + pct[i] + " %");
-            BattSound(pct[pct.Length - 1]);
+            StageTone(20);
         }
 
-        // Ton zur Akku-Meldung (Windows-Klangschema): unter 30 % Warnton, sonst Hinweiston
-        static void BattSound(int percent)
+        // Ton zur Stufe (100 = voll geladen), sofern "Alle Toene" und der einzelne Ton an sind
+        void StageTone(int stage)
         {
-            try
-            {
-                if (percent < 30) System.Media.SystemSounds.Exclamation.Play();
-                else System.Media.SystemSounds.Asterisk.Play();
-            }
-            catch { }
+            int idx = stage == 100 ? 5 : Array.IndexOf(Steps, stage);
+            if (idx >= 0 && battSoundAll && battSound[idx]) BattTones.Play(idx);
+        }
+
+        string ToneString()
+        {
+            char[] c = new char[battSound.Length];
+            for (int i = 0; i < c.Length; i++) c[i] = battSound[i] ? '1' : '0';
+            return new string(c);
+        }
+
+        static Rectangle ToneRect(int i)
+        {
+            return new Rectangle(BT_TONE_X + i * (BT_TONE_W + BT_TONE_GAP), BT_TONE_Y, BT_TONE_W, BT_TONE_H);
         }
 
         // Text unter dem Geraetenamen auf der Akku-Seite
@@ -2320,6 +2418,9 @@ namespace PurpleClicker
             {
                 if (R_BtDropSw.Contains(p)) return Hit.BtDropSw;
                 if (R_BtBootSw.Contains(p)) return Hit.BtBootSw;
+                if (R_BtSoundSw.Contains(p)) return Hit.BtSoundSw;
+                for (int i = 0; i < ToneNames.Length; i++)
+                    if (ToneRect(i).Contains(p)) { hitIndex = i; return Hit.BtTone; }
                 if (R_Start.Contains(p)) return Hit.BtPreview;
                 return Hit.None;
             }
@@ -2518,6 +2619,15 @@ namespace PurpleClicker
                 case Hit.BtDropSw: battDropMsg = !battDropMsg; SaveSettings(); break;
                 case Hit.BtBootSw: battBootMsg = !battBootMsg; SaveSettings(); break;
                 case Hit.BtPreview: ShowBatteryPreview(); break;
+                case Hit.BtSoundSw: battSoundAll = !battSoundAll; SaveSettings(); break;
+                case Hit.BtTone:
+                    if (idx >= 0 && idx < battSound.Length)
+                    {
+                        battSound[idx] = !battSound[idx];
+                        if (battSound[idx]) BattTones.Play(idx);   // beim Einschalten einmal zur Probe
+                        SaveSettings();
+                    }
+                    break;
                 case Hit.RmSw: SetRemapOn(!remap.On); break;
                 case Hit.RmPrev: if (idx >= 0) remap.Cycle(idx, -1); break;
                 case Hit.RmNext:
@@ -3239,15 +3349,15 @@ namespace PurpleClicker
             {
                 BattDev d = Battery.Devices[i];
                 int y = BT_Y0 + i * BT_ROW;
-                Rectangle row = new Rectangle(36, y, 628, BT_ROW - 12);
+                Rectangle row = new Rectangle(36, y, 628, BT_ROW - 10);
                 float rr = Math.Min(RadCtl(row.Height), 12f);
                 FillRR(g, C_Field, row, rr);
                 StrokeRR(g, C_CardLine, row, rr, 1f);
                 Color lc = d.Known ? DevIcons.Level(d.Last.Percent) : C_Dim;
                 if (!d.Online) lc = Color.FromArgb(110, lc);
-                DevIcons.Draw(g, d.Kind, new RectangleF(52, y + 12, 32, 32), d.Online ? C_Text : C_Dim, 1.8f);
-                DrawText(g, d.Name, fBtn, d.Online ? C_Text : C_Dim, new Rectangle(100, y + 8, 230, 22), StringAlignment.Near);
-                DrawText(g, BattStatus(d), fChip, C_Dim, new Rectangle(100, y + 28, 236, 20), StringAlignment.Near);
+                DevIcons.Draw(g, d.Kind, new RectangleF(54, y + 9, 28, 28), d.Online ? C_Text : C_Dim, 1.8f);
+                DrawText(g, d.Name, fBtn, d.Online ? C_Text : C_Dim, new Rectangle(100, y + 4, 230, 22), StringAlignment.Near);
+                DrawText(g, BattStatus(d), fChip, C_Dim, new Rectangle(100, y + 24, 236, 18), StringAlignment.Near);
 
                 // Balken in der Ampelfarbe
                 Rectangle track = new Rectangle(barX, y + row.Height / 2 - 4, barW, 8);
@@ -3259,15 +3369,32 @@ namespace PurpleClicker
             }
 
             using (Pen sep = new Pen(C_CardLine, 1f))
-                g.DrawLine(sep, 36, 314, 664, 314);
-            DrawText(g, "Meldung, wenn der Akku fällt", fBtn, C_Text, new Rectangle(40, 322, 560, 20), StringAlignment.Near);
-            DrawText(g, "Bei 75 · 50 · 30 · 20 · 10 % (Maus 80 · 50 · 30 · 20 · 10 %) und wenn ein Gerät voll geladen ist",
-                fChip, C_Dim, new Rectangle(40, 342, 570, 18), StringAlignment.Near);
+                g.DrawLine(sep, 36, 264, 664, 264);
+            DrawText(g, "Meldung, wenn der Akku fällt", fBtn, C_Text, new Rectangle(40, 270, 560, 20), StringAlignment.Near);
+            DrawText(g, "Bei 70 · 50 · 30 · 20 · 10 % und wenn ein Gerät voll geladen ist",
+                fChip, C_Dim, new Rectangle(40, 289, 570, 18), StringAlignment.Near);
             Switch(g, R_BtDropSw, battDropMsg, hover == Hit.BtDropSw);
-            DrawText(g, "Meldung beim PC-Start", fBtn, C_Text, new Rectangle(40, 378, 560, 20), StringAlignment.Near);
+            DrawText(g, "Meldung beim PC-Start", fBtn, C_Text, new Rectangle(40, 314, 560, 20), StringAlignment.Near);
             DrawText(g, "Stand aller Geräte, wenn Purple Clicker mit Windows startet (Autostart)",
-                fChip, C_Dim, new Rectangle(40, 398, 570, 18), StringAlignment.Near);
+                fChip, C_Dim, new Rectangle(40, 333, 570, 18), StringAlignment.Near);
             Switch(g, R_BtBootSw, battBootMsg, hover == Hit.BtBootSw);
+
+            // Toene: je Stand an/aus, Hauptschalter rechts
+            DrawText(g, "Töne", fBtn, C_Text, new Rectangle(40, 358, 120, 20), StringAlignment.Near);
+            DrawText(g, "Klick = an/aus, beim Einschalten zur Probe", fChip, C_Dim, new Rectangle(100, 358, 400, 20), StringAlignment.Near);
+            for (int i = 0; i < ToneNames.Length; i++)
+            {
+                Rectangle r = ToneRect(i);
+                bool on = battSound[i], hot = hover == Hit.BtTone && hoverIdx == i;
+                float rad = RadCtl(r.Height);
+                if (on) FillRR(g, A(battSoundAll ? (hot ? 64 : 40) : 18, C_Accent), r, rad);
+                else FillRR(g, hot ? C_BtnHover : C_Btn, r, rad);
+                StrokeRR(g, on && battSoundAll ? C_Accent : C_CardLine, r, rad, 1f);
+                DrawText(g, ToneNames[i], fChip, on ? (battSoundAll ? C_Accent : C_Dim) : C_Dim, r, StringAlignment.Center);
+            }
+            DrawText(g, "Alle Töne", fChip, battSoundAll ? C_Text : C_Dim,
+                new Rectangle(500, R_BtSoundSw.Y, R_BtSoundSw.X - 508, R_BtSoundSw.Height), StringAlignment.Far);
+            Switch(g, R_BtSoundSw, battSoundAll, hover == Hit.BtSoundSw);
 
             FillRR(g, hover == Hit.BtPreview ? C_BtnHover : C_Btn, R_Start, radStart);
             StrokeRR(g, C_CardLine, R_Start, radStart, 1f);
@@ -3548,6 +3675,10 @@ namespace PurpleClicker
                         case "OverlaySec": overlaySec = Math.Min(Math.Max(v, 1), 10); break;
                         case "BattDropMsg": battDropMsg = v != 0; break;
                         case "BattBootMsg": battBootMsg = v != 0; break;
+                        case "BattSoundAll": battSoundAll = v != 0; break;
+                        case "BattSounds":
+                            for (int si = 0; si < battSound.Length && si < raw.Length; si++) battSound[si] = raw[si] != '0';
+                            break;
                         case "Theme": theme = ThemeFromSetting(raw); break;
                         case "Programs":
                             programs.Clear();
@@ -3589,6 +3720,8 @@ namespace PurpleClicker
                     "OverlaySec=" + overlaySec,
                     "BattDropMsg=" + (battDropMsg ? 1 : 0),
                     "BattBootMsg=" + (battBootMsg ? 1 : 0),
+                    "BattSoundAll=" + (battSoundAll ? 1 : 0),
+                    "BattSounds=" + ToneString(),
                     "Theme=" + ThemeNames[theme],
                     "Programs=" + string.Join(";", programs.ToArray())
                 });
