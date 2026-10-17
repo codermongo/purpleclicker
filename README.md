@@ -9,7 +9,7 @@ Kleiner Autoclicker für Windows mit AMOLED-Oberfläche, gebaut in C# (WinForms)
 - Hotkey nur in gewählten Programmen aktiv (Meldung bei Erkennung)
 - Autostart mit Windows (startet im Tray)
 - Maus-Umbelegung: Tasten, Rad und Kippen frei belegen (Linksklick, Rechtsklick, Doppelklick, Deaktiviert usw.), Mausbild mit Markern, Aufnahme-Modus erkennt, welche Tasten die Maus meldet
-- Akku-Anzeige ohne Herstellersoftware (Corsair HS80 MAX, ROG Strix Scope II 96, Attack Shark X3): eigene Seite mit Stand aller Geräte, Meldung oben rechts beim Unterschreiten von 70/50/30/20/10 % und bei „voll geladen“, mit eigenem Signalton je Stand (einzeln und gesamt abschaltbar), Stand aller Geräte beim PC-Start; Meldungen abschaltbar. Laden löst keine Stufen-Meldungen aus. `--battery-sim` spielt zum Testen erfundene Werte ab
+- Akku-Anzeige ohne Herstellersoftware (Corsair HS80 MAX, ROG Strix Scope II 96, Attack Shark X3): eigene Seite mit Stand aller Geräte, Meldung oben rechts beim Unterschreiten von 70/50/30/20/10 % und bei „voll geladen“, bei 30 und 10 % zusätzlich als Windows-Benachrichtigung (Wecker-Art, erscheint auch im Vollbild, mit Windows-Signalton), Stand aller Geräte beim PC-Start; alles einzeln abschaltbar, ohne Admin-Rechte. Laden löst keine Stufen-Meldungen aus. `--battery-sim` spielt zum Testen erfundene Werte ab
 
 ## Bauen
 Keine Installation nötig, es wird der in Windows enthaltene C#-Compiler benutzt:

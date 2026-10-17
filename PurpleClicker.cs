@@ -85,6 +85,8 @@ namespace PurpleClicker
         public static extern uint timeBeginPeriod(uint ms);
         [DllImport("winmm.dll")]
         public static extern uint timeEndPeriod(uint ms);
+        [DllImport("winmm.dll", CharSet = CharSet.Unicode)]
+        public static extern bool PlaySound(string name, IntPtr hmod, uint flags);
         [DllImport("dwmapi.dll")]
         public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
         [DllImport("dwmapi.dll")]
@@ -941,95 +943,6 @@ namespace PurpleClicker
         }
     }
 
-    // Signaltoene der Akku-Meldungen: gezupfte Saite (Karplus-Strong), im Speicher erzeugt, keine Dateien.
-    // Index 0..5 = 70, 50, 30, 20, 10 %, Voll geladen; je hoeher der Akku, desto freundlicher die Tonfolge.
-    static class BattTones
-    {
-        const int SR = 44100;
-        const double A4 = 440, C5 = 523.25, D5 = 587.33, E5 = 659.25, G5 = 783.99, A5 = 880, C6 = 1046.5;
-        // je Stand: {Start ms, Frequenz}
-        static readonly double[][][] Melody = {
-            new[] { new[] { 0.0, E5 }, new[] { 150.0, A5 } },                                   // 70: Quarte aufwaerts
-            new[] { new[] { 0.0, D5 }, new[] { 240.0, D5 } },                                   // 50: zwei gleiche Toene
-            new[] { new[] { 0.0, G5 }, new[] { 200.0, E5 } },                                   // 30: kleine Terz abwaerts
-            new[] { new[] { 0.0, E5 }, new[] { 180.0, C5 }, new[] { 360.0, A4 } },              // 20: drei Toene abwaerts
-            new[] { new[] { 0.0, E5 }, new[] { 170.0, C5 }, new[] { 560.0, E5 }, new[] { 730.0, C5 },
-                    new[] { 1120.0, E5 }, new[] { 1290.0, C5 } },                               // 10: ding-dong dreimal
-            new[] { new[] { 0.0, C5 }, new[] { 120.0, E5 }, new[] { 240.0, G5 }, new[] { 360.0, C6 } }, // Voll: Dur-Dreiklang
-        };
-        static readonly byte[][] cache = new byte[6][];
-        static System.Media.SoundPlayer player;   // Referenz halten, solange der Ton laeuft
-
-        public static void Play(int index)
-        {
-            try
-            {
-                if (index < 0 || index >= cache.Length) return;
-                if (cache[index] == null) cache[index] = Wav(index);
-                System.Media.SoundPlayer old = player;
-                player = new System.Media.SoundPlayer(new MemoryStream(cache[index]));
-                player.Play();   // asynchron; ein neuer Ton ersetzt einen laufenden
-                if (old != null) old.Dispose();
-            }
-            catch { }
-        }
-
-        static byte[] Wav(int index)
-        {
-            const double ring = 1300;
-            double[][] notes = Melody[index];
-            double[] buf = new double[(int)(SR * (notes[notes.Length - 1][0] + ring) / 1000)];
-            Random rnd = new Random(7);
-            foreach (double[] n in notes)
-            {
-                int s0 = (int)(SR * n[0] / 1000);
-                int len = Math.Min((int)(SR * ring / 1000), buf.Length - s0);
-                double[] v = Pluck(n[1], len, rnd);
-                for (int i = 0; i < len; i++) buf[s0 + i] += v[i];
-            }
-            // weiches Ende, leise und einheitliche Lautstaerke (Spitze 22 %)
-            int fade = SR / 20;
-            for (int i = 0; i < fade && i < buf.Length; i++) buf[buf.Length - 1 - i] *= (double)i / fade;
-            double peak = 0;
-            foreach (double x in buf) peak = Math.Max(peak, Math.Abs(x));
-            double gain = peak > 0 ? 0.22 / peak : 0;
-
-            MemoryStream ms = new MemoryStream();
-            BinaryWriter w = new BinaryWriter(ms);
-            w.Write(new[] { 'R', 'I', 'F', 'F' }); w.Write(36 + buf.Length * 2);
-            w.Write(new[] { 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ' });
-            w.Write(16); w.Write((short)1); w.Write((short)1); w.Write(SR); w.Write(SR * 2); w.Write((short)2); w.Write((short)16);
-            w.Write(new[] { 'd', 'a', 't', 'a' }); w.Write(buf.Length * 2);
-            foreach (double x in buf) w.Write((short)(Math.Max(-1.0, Math.Min(1.0, x * gain)) * 32767));
-            return ms.ToArray();
-        }
-
-        // Gezupfte Saite (Karplus-Strong) mit Allpass-Feinstimmung
-        static double[] Pluck(double f, int len, Random rnd)
-        {
-            double period = SR / f - 0.5;
-            int n = (int)Math.Floor(period);
-            double d = period - n, c = (1 - d) / (1 + d);
-            double[] line = new double[n];
-            double s = 0;
-            for (int i = 0; i < n; i++) { s += 0.5 * ((rnd.NextDouble() * 2 - 1) - s); line[i] = s; }   // weiches Anzupfen
-            double[] o = new double[len];
-            int p = 0;
-            double apX = 0, apY = 0;
-            for (int i = 0; i < len; i++)
-            {
-                double cur = line[p], next = line[(p + 1) % n];
-                double avg = 0.4985 * (cur + next);
-                double y = c * avg + apX - c * apY;   // Allpass fuer den Bruchteil der Verzoegerung
-                apX = avg; apY = y;
-                line[p] = y;
-                o[i] = cur;
-                p = (p + 1) % n;
-            }
-            return o;
-        }
-    }
-
     class ProcItem
     {
         public string Exe;
@@ -1269,7 +1182,7 @@ namespace PurpleClicker
         AutoSw, FilterSw, MulSlider, MulSw, MulKey, DurSlider, ChipX, ChipAdd, PopItem, PopPanel, PopOutside,
         Gear, ThemeItem, ThemePanel, ThemeOutside,
         MouseBtn, RmSw, RmPrev, RmNext, RmMid, RmReset, RmBadge, RmRow, RmModel, RmRec,
-        BattBtn, BtDropSw, BtBootSw, BtPreview, BtSoundSw, BtTone
+        BattBtn, BtDropSw, BtToastSw, BtBootSw, BtPreview
     }
 
     // ------------------------------------------------------------------ Fenster
@@ -1309,12 +1222,10 @@ namespace PurpleClicker
         // Akku-Seite
         static readonly Rectangle R_BattBtn = new Rectangle(498, 13, 30, 30);
         static readonly Rectangle R_BtCard = new Rectangle(20, 64, 660, 374);
-        const int BT_Y0 = 96, BT_ROW = 56;                                       // Geraetezeilen
-        static readonly Rectangle R_BtDropSw = new Rectangle(620, 276, 44, 24);
-        static readonly Rectangle R_BtBootSw = new Rectangle(620, 320, 44, 24);
-        static readonly Rectangle R_BtSoundSw = new Rectangle(620, 384, 44, 24);
-        const int BT_TONE_X = 40, BT_TONE_Y = 382, BT_TONE_W = 64, BT_TONE_H = 28, BT_TONE_GAP = 8;   // Ton-Chips
-        static readonly string[] ToneNames = { "70 %", "50 %", "30 %", "20 %", "10 %", "Voll" };
+        const int BT_Y0 = 100, BT_ROW = 60;                                      // Geraetezeilen
+        static readonly Rectangle R_BtDropSw = new Rectangle(620, 290, 44, 24);
+        static readonly Rectangle R_BtToastSw = new Rectangle(620, 334, 44, 24);
+        static readonly Rectangle R_BtBootSw = new Rectangle(620, 378, 44, 24);
         // Maus-Seite (Umbelegung)
         static readonly Rectangle R_MouseBtn = new Rectangle(536, 13, 30, 30);
         static readonly Rectangle R_RmCard = new Rectangle(20, 64, 660, 374);
@@ -1625,15 +1536,15 @@ namespace PurpleClicker
 
         // Akku-Meldungen
         bool battDropMsg = true;          // Meldung, wenn eine Stufe unterschritten wird (und bei voll geladen)
+        bool battToastMsg = true;         // bei 30 und 10 % zusaetzlich als Windows-Benachrichtigung
         bool battBootMsg = true;          // Stand aller Geraete, wenn Purple Clicker mit Windows startet
         readonly bool bootStart;          // per Autostart (--tray) gestartet
         bool bootPending;                 // Start-Meldung steht noch aus
         int bootDeadline;
         readonly List<OverlayForm> battOverlays = new List<OverlayForm>();   // Index + 1 = Platz unter der Klick-Meldung
-        bool battSoundAll = true;                                           // Hauptschalter "Alle Toene"
-        readonly bool[] battSound = { true, true, true, true, true, true }; // je Ton: 70, 50, 30, 20, 10 %, Voll
         static readonly int[] Steps = { 70, 50, 30, 20, 10 };
         const int BattMsgSec = 12;        // Anzeigedauer der Akku-Meldungen, unabhaengig vom Schieber "MELDUNG"
+        const int ToastSec = 6;           // Anzeigedauer der Windows-Benachrichtigung bei 30/10 %
 
         public MainForm(bool hidden, bool noServices)
         {
@@ -1788,6 +1699,9 @@ namespace PurpleClicker
 
             UpdateFgTimer();
             ForegroundTick();
+
+            RegisterToastAppId();
+            if (battToastMsg) AllowToastInFullscreen();
 
             // Akkustand im Hintergrund abfragen; beim Hochfahren oefter, bis alle Geraete da sind
             bootPending = bootStart && battBootMsg;
@@ -2167,10 +2081,10 @@ namespace PurpleClicker
                 d.Last = r;
                 d.Known = true;
                 d.LastSeen = Environment.TickCount;
-                if (stage != 0 && battDropMsg && !bootPending)
+                if (stage != 0 && !bootPending)
                 {
-                    ShowBattery(d, r.Percent, stage == 100 ? "Voll geladen · 100 %" : "Akku " + r.Percent + " %");
-                    StageTone(stage);
+                    if (battDropMsg) ShowBattery(d, r.Percent, stage == 100 ? "Voll geladen · 100 %" : "Akku " + r.Percent + " %");
+                    if (battToastMsg && (stage == 30 || stage == 10)) BatteryToast(d, r.Percent);
                 }
             }
             if (bootPending) CheckBoot();
@@ -2249,26 +2163,96 @@ namespace PurpleClicker
             int[] pct = { 80, 50, 20 };
             for (int i = 0; i < Battery.Devices.Length; i++)
                 ShowBattery(Battery.Devices[i], pct[i], "Vorschau · Akku " + pct[i] + " %");
-            StageTone(20);
         }
 
-        // Ton zur Stufe (100 = voll geladen), sofern "Alle Toene" und der einzelne Ton an sind
-        void StageTone(int stage)
+        // Windows-Benachrichtigung bei 30 und 10 %: als "wichtig" (kommt mit Erlaubnis auch bei "Nicht stoeren" durch),
+        // sonst ueber das Tray-Symbol
+        void BatteryToast(BattDev d, int percent)
         {
-            int idx = stage == 100 ? 5 : Array.IndexOf(Steps, stage);
-            if (idx >= 0 && battSoundAll && battSound[idx]) BattTones.Play(idx);
+            string kind = d.Kind == DevKind.Headset ? "Headset" : d.Kind == DevKind.Mouse ? "Maus" : "Tastatur";
+            string title = kind + ": Akku " + percent + " %";
+            string text = d.Name + " hat noch " + percent + " % Akku.";
+            if (ShowUrgentToast(title, text) || notify == null) return;
+            try { notify.ShowBalloonTip(10000, title, text, percent <= 10 ? ToolTipIcon.Warning : ToolTipIcon.Info); }
+            catch { }
         }
 
-        string ToneString()
+        const string ToastAppId = "netpurple.PurpleClicker";
+
+        // Eigene App-Kennung fuer moderne Windows-Benachrichtigungen (nur Benutzer-Registry, keine Verknuepfung noetig)
+        void RegisterToastAppId()
         {
-            char[] c = new char[battSound.Length];
-            for (int i = 0; i < c.Length; i++) c[i] = battSound[i] ? '1' : '0';
-            return new string(c);
+            try
+            {
+                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PurpleClicker");
+                string png = Path.Combine(dir, "toast.png");
+                if (!File.Exists(png) && logo != null)
+                {
+                    Directory.CreateDirectory(dir);
+                    logo.Save(png, ImageFormat.Png);
+                }
+                using (RegistryKey k = Registry.CurrentUser.CreateSubKey(@"Software\Classes\AppUserModelId\" + ToastAppId))
+                {
+                    k.SetValue("DisplayName", "Purple Clicker");
+                    if (File.Exists(png)) k.SetValue("IconUri", png);
+                }
+            }
+            catch { }
         }
 
-        static Rectangle ToneRect(int i)
+        // "Wichtige Benachrichtigungen" fuer Purple Clicker erlauben, damit sie auch bei "Nicht stoeren" (Vollbild)
+        // durchkommen; derselbe Wert, den der Schalter in den Windows-Einstellungen setzt (nur Benutzer-Registry)
+        static void AllowToastInFullscreen()
         {
-            return new Rectangle(BT_TONE_X + i * (BT_TONE_W + BT_TONE_GAP), BT_TONE_Y, BT_TONE_W, BT_TONE_H);
+            try
+            {
+                using (RegistryKey k = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\" + ToastAppId))
+                    k.SetValue("AllowUrgentNotifications", 1, RegistryValueKind.DWord);
+            }
+            catch { }
+        }
+
+        // Moderne Windows-Benachrichtigung als "Wecker" (scenario="alarm"): nur diese Art zeigt im Vollbild bei
+        // "Nicht stoeren" den vollen Inhalt (wichtige/dringende werden dort zu "View notification" verkuerzt).
+        // Der Wecker-Typ erzwingt sein Klingeln, deshalb stumm senden und selbst den normalen Windows-Benachrichtigungston
+        // (Klangschema "Benachrichtigung") spielen. Ein Wecker bliebe bis zum Klick stehen, deshalb nach ToastSec selbst wegraeumen.
+        // WinRT wird zur Laufzeit geladen (keine Build-Aenderung).
+        static bool ShowUrgentToast(string title, string text)
+        {
+            try
+            {
+                Type mgrT = Type.GetType("Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime");
+                Type toastT = Type.GetType("Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType=WindowsRuntime");
+                Type notifierT = Type.GetType("Windows.UI.Notifications.ToastNotifier, Windows.UI.Notifications, ContentType=WindowsRuntime");
+                Type xmlT = Type.GetType("Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType=WindowsRuntime");
+                if (mgrT == null || toastT == null || notifierT == null || xmlT == null) return false;
+                object xml = Activator.CreateInstance(xmlT);
+                xmlT.GetMethod("LoadXml", new[] { typeof(string) }).Invoke(xml, new object[] {
+                    "<toast scenario=\"alarm\"><visual><binding template=\"ToastGeneric\"><text>" +
+                    System.Security.SecurityElement.Escape(title) + "</text><text>" +
+                    System.Security.SecurityElement.Escape(text) + "</text></binding></visual>" +
+                    "<actions><action content=\"OK\" arguments=\"dismiss\" activationType=\"system\"/></actions>" +
+                    "<audio silent=\"true\"/></toast>" });
+                object toast = Activator.CreateInstance(toastT, xml);
+                System.Reflection.PropertyInfo prio = toastT.GetProperty("Priority");
+                if (prio != null) prio.SetValue(toast, Enum.ToObject(prio.PropertyType, 1), null);   // ToastNotificationPriority.High
+                object notifier = mgrT.GetMethod("CreateToastNotifier", new[] { typeof(string) }).Invoke(null, new object[] { ToastAppId });
+                notifierT.GetMethod("Show").Invoke(notifier, new[] { toast });
+                Native.PlaySound("Notification.Default", IntPtr.Zero, 0x10000 | 0x0002 | 0x0001);   // SND_ALIAS | SND_NODEFAULT | SND_ASYNC
+                // im selben (UI-)Thread wegraeumen, dem die Benachrichtigung gehoert; je Benachrichtigung ein Timer
+                System.Reflection.MethodInfo hide = notifierT.GetMethod("Hide");
+                System.Windows.Forms.Timer t = new System.Windows.Forms.Timer();
+                t.Interval = ToastSec * 1000;
+                t.Tick += delegate
+                {
+                    t.Stop();
+                    t.Dispose();
+                    try { hide.Invoke(notifier, new[] { toast }); } catch { }
+                };
+                t.Start();
+                return true;
+            }
+            catch { return false; }
         }
 
         // Text unter dem Geraetenamen auf der Akku-Seite
@@ -2417,10 +2401,8 @@ namespace PurpleClicker
             if (page == 2)
             {
                 if (R_BtDropSw.Contains(p)) return Hit.BtDropSw;
+                if (R_BtToastSw.Contains(p)) return Hit.BtToastSw;
                 if (R_BtBootSw.Contains(p)) return Hit.BtBootSw;
-                if (R_BtSoundSw.Contains(p)) return Hit.BtSoundSw;
-                for (int i = 0; i < ToneNames.Length; i++)
-                    if (ToneRect(i).Contains(p)) { hitIndex = i; return Hit.BtTone; }
                 if (R_Start.Contains(p)) return Hit.BtPreview;
                 return Hit.None;
             }
@@ -2617,17 +2599,13 @@ namespace PurpleClicker
                     themeOpen = false;
                     break;
                 case Hit.BtDropSw: battDropMsg = !battDropMsg; SaveSettings(); break;
+                case Hit.BtToastSw:
+                    battToastMsg = !battToastMsg;
+                    if (battToastMsg) AllowToastInFullscreen();
+                    SaveSettings();
+                    break;
                 case Hit.BtBootSw: battBootMsg = !battBootMsg; SaveSettings(); break;
                 case Hit.BtPreview: ShowBatteryPreview(); break;
-                case Hit.BtSoundSw: battSoundAll = !battSoundAll; SaveSettings(); break;
-                case Hit.BtTone:
-                    if (idx >= 0 && idx < battSound.Length)
-                    {
-                        battSound[idx] = !battSound[idx];
-                        if (battSound[idx]) BattTones.Play(idx);   // beim Einschalten einmal zur Probe
-                        SaveSettings();
-                    }
-                    break;
                 case Hit.RmSw: SetRemapOn(!remap.On); break;
                 case Hit.RmPrev: if (idx >= 0) remap.Cycle(idx, -1); break;
                 case Hit.RmNext:
@@ -3349,13 +3327,13 @@ namespace PurpleClicker
             {
                 BattDev d = Battery.Devices[i];
                 int y = BT_Y0 + i * BT_ROW;
-                Rectangle row = new Rectangle(36, y, 628, BT_ROW - 10);
+                Rectangle row = new Rectangle(36, y, 628, BT_ROW - 12);
                 float rr = Math.Min(RadCtl(row.Height), 12f);
                 FillRR(g, C_Field, row, rr);
                 StrokeRR(g, C_CardLine, row, rr, 1f);
                 Color lc = d.Known ? DevIcons.Level(d.Last.Percent) : C_Dim;
                 if (!d.Online) lc = Color.FromArgb(110, lc);
-                DevIcons.Draw(g, d.Kind, new RectangleF(54, y + 9, 28, 28), d.Online ? C_Text : C_Dim, 1.8f);
+                DevIcons.Draw(g, d.Kind, new RectangleF(52, y + 8, 32, 32), d.Online ? C_Text : C_Dim, 1.8f);
                 DrawText(g, d.Name, fBtn, d.Online ? C_Text : C_Dim, new Rectangle(100, y + 4, 230, 22), StringAlignment.Near);
                 DrawText(g, BattStatus(d), fChip, C_Dim, new Rectangle(100, y + 24, 236, 18), StringAlignment.Near);
 
@@ -3369,32 +3347,19 @@ namespace PurpleClicker
             }
 
             using (Pen sep = new Pen(C_CardLine, 1f))
-                g.DrawLine(sep, 36, 264, 664, 264);
-            DrawText(g, "Meldung, wenn der Akku fällt", fBtn, C_Text, new Rectangle(40, 270, 560, 20), StringAlignment.Near);
-            DrawText(g, "Bei 70 · 50 · 30 · 20 · 10 % und wenn ein Gerät voll geladen ist",
-                fChip, C_Dim, new Rectangle(40, 289, 570, 18), StringAlignment.Near);
+                g.DrawLine(sep, 36, 278, 664, 278);
+            DrawText(g, "Meldung, wenn der Akku fällt", fBtn, C_Text, new Rectangle(40, 284, 560, 20), StringAlignment.Near);
+            DrawText(g, "Oben rechts bei 70 · 50 · 30 · 20 · 10 % und wenn ein Gerät voll geladen ist",
+                fChip, C_Dim, new Rectangle(40, 303, 570, 18), StringAlignment.Near);
             Switch(g, R_BtDropSw, battDropMsg, hover == Hit.BtDropSw);
-            DrawText(g, "Meldung beim PC-Start", fBtn, C_Text, new Rectangle(40, 314, 560, 20), StringAlignment.Near);
+            DrawText(g, "Bei 30 und 10 % auch als Windows-Benachrichtigung", fBtn, C_Text, new Rectangle(40, 328, 560, 20), StringAlignment.Near);
+            DrawText(g, "Mit Windows-Signalton, erscheint auch im Vollbild, verschwindet nach " + ToastSec + " s",
+                fChip, C_Dim, new Rectangle(40, 347, 570, 18), StringAlignment.Near);
+            Switch(g, R_BtToastSw, battToastMsg, hover == Hit.BtToastSw);
+            DrawText(g, "Meldung beim PC-Start", fBtn, C_Text, new Rectangle(40, 372, 560, 20), StringAlignment.Near);
             DrawText(g, "Stand aller Geräte, wenn Purple Clicker mit Windows startet (Autostart)",
-                fChip, C_Dim, new Rectangle(40, 333, 570, 18), StringAlignment.Near);
+                fChip, C_Dim, new Rectangle(40, 391, 570, 18), StringAlignment.Near);
             Switch(g, R_BtBootSw, battBootMsg, hover == Hit.BtBootSw);
-
-            // Toene: je Stand an/aus, Hauptschalter rechts
-            DrawText(g, "Töne", fBtn, C_Text, new Rectangle(40, 358, 120, 20), StringAlignment.Near);
-            DrawText(g, "Klick = an/aus, beim Einschalten zur Probe", fChip, C_Dim, new Rectangle(100, 358, 400, 20), StringAlignment.Near);
-            for (int i = 0; i < ToneNames.Length; i++)
-            {
-                Rectangle r = ToneRect(i);
-                bool on = battSound[i], hot = hover == Hit.BtTone && hoverIdx == i;
-                float rad = RadCtl(r.Height);
-                if (on) FillRR(g, A(battSoundAll ? (hot ? 64 : 40) : 18, C_Accent), r, rad);
-                else FillRR(g, hot ? C_BtnHover : C_Btn, r, rad);
-                StrokeRR(g, on && battSoundAll ? C_Accent : C_CardLine, r, rad, 1f);
-                DrawText(g, ToneNames[i], fChip, on ? (battSoundAll ? C_Accent : C_Dim) : C_Dim, r, StringAlignment.Center);
-            }
-            DrawText(g, "Alle Töne", fChip, battSoundAll ? C_Text : C_Dim,
-                new Rectangle(500, R_BtSoundSw.Y, R_BtSoundSw.X - 508, R_BtSoundSw.Height), StringAlignment.Far);
-            Switch(g, R_BtSoundSw, battSoundAll, hover == Hit.BtSoundSw);
 
             FillRR(g, hover == Hit.BtPreview ? C_BtnHover : C_Btn, R_Start, radStart);
             StrokeRR(g, C_CardLine, R_Start, radStart, 1f);
@@ -3674,11 +3639,8 @@ namespace PurpleClicker
                         case "Multi": multiplier = Math.Min(Math.Max(v, 1), 10); break;
                         case "OverlaySec": overlaySec = Math.Min(Math.Max(v, 1), 10); break;
                         case "BattDropMsg": battDropMsg = v != 0; break;
+                        case "BattToastMsg": battToastMsg = v != 0; break;
                         case "BattBootMsg": battBootMsg = v != 0; break;
-                        case "BattSoundAll": battSoundAll = v != 0; break;
-                        case "BattSounds":
-                            for (int si = 0; si < battSound.Length && si < raw.Length; si++) battSound[si] = raw[si] != '0';
-                            break;
                         case "Theme": theme = ThemeFromSetting(raw); break;
                         case "Programs":
                             programs.Clear();
@@ -3719,9 +3681,8 @@ namespace PurpleClicker
                     "Multi=" + multiplier,
                     "OverlaySec=" + overlaySec,
                     "BattDropMsg=" + (battDropMsg ? 1 : 0),
+                    "BattToastMsg=" + (battToastMsg ? 1 : 0),
                     "BattBootMsg=" + (battBootMsg ? 1 : 0),
-                    "BattSoundAll=" + (battSoundAll ? 1 : 0),
-                    "BattSounds=" + ToneString(),
                     "Theme=" + ThemeNames[theme],
                     "Programs=" + string.Join(";", programs.ToArray())
                 });
