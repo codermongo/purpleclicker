@@ -5,9 +5,11 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Drawing.Text;
+using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -950,6 +952,70 @@ namespace PurpleClicker
         public ProcItem(string exe, string title) { Exe = exe; Title = title; }
     }
 
+    // ------------------------------------------------------------------ Artillerie-Rechner (Wardogs, Moerser L81)
+    // Kartenkoordinaten: 1 Einheit = 100 m, Y waechst nach Norden
+    static class Arty
+    {
+        public const int MinRange = 130, MaxRange = 685;   // Reichweite L81 laut Community-Guides
+        static readonly Regex Num = new Regex(@"[0-9]+(?:[.,][0-9]+)?");
+        static readonly string[] Dirs = { "N", "NNO", "NO", "ONO", "O", "OSO", "SO", "SSO", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW" };
+
+        // Die ersten zwei Zahlen im Text, z. B. "x77.11, y75.32"; Komma direkt zwischen Ziffern = Dezimalzeichen
+        public static bool Parse(string s, out double a, out double b)
+        {
+            a = b = 0;
+            MatchCollection m = Num.Matches(s ?? "");
+            if (m.Count < 2) return false;
+            a = double.Parse(m[0].Value.Replace(',', '.'), CultureInfo.InvariantCulture);
+            b = double.Parse(m[1].Value.Replace(',', '.'), CultureInfo.InvariantCulture);
+            return true;
+        }
+
+        public static string Coord(double x, double y)
+        {
+            return "x" + x.ToString("0.00", CultureInfo.InvariantCulture) + ", y" + y.ToString("0.00", CultureInfo.InvariantCulture);
+        }
+
+        public static string Num4(double v) { return v.ToString("0.####", CultureInfo.InvariantCulture); }
+
+        public static double Distance(double x0, double y0, double x1, double y1)
+        {
+            double dx = x1 - x0, dy = y1 - y0;
+            return 100.0 * Math.Sqrt(dx * dx + dy * dy);
+        }
+
+        // Richtung in Grad, Norden = 0, im Uhrzeigersinn
+        public static double Bearing(double x0, double y0, double x1, double y1)
+        {
+            double deg = Math.Atan2(x1 - x0, y1 - y0) * 180.0 / Math.PI;
+            return deg < 0 ? deg + 360.0 : deg;
+        }
+
+        public static string Compass(double deg) { return Dirs[(int)Math.Round(deg / 22.5) % 16]; }
+
+        public static double ToMil(double deg) { return deg * 6400.0 / 360.0; }
+
+        // Schusstafel: nach Entfernung sortierte Paare {m, Mil}, dazwischen linear; NaN ausserhalb der Tafel
+        public static double Elevation(List<int[]> t, double d)
+        {
+            if (t.Count == 0 || d < t[0][0] || d > t[t.Count - 1][0]) return double.NaN;
+            for (int i = 1; i < t.Count; i++)
+                if (d <= t[i][0])
+                {
+                    double f = (d - t[i - 1][0]) / (t[i][0] - t[i - 1][0]);
+                    return t[i - 1][1] + f * (t[i][1] - t[i - 1][1]);
+                }
+            return t[0][1];   // nur ein Eintrag, genau getroffen
+        }
+    }
+
+    class ArTarget
+    {
+        public int No;
+        public double X, Y;
+        public ArTarget(int no, double x, double y) { No = no; X = x; Y = y; }
+    }
+
     // Dunkles Kontextmenue fuer das Tray-Icon
     class DarkColors : ProfessionalColorTable
     {
@@ -1183,6 +1249,7 @@ namespace PurpleClicker
         Gear, ThemeItem, ThemePanel, ThemeOutside,
         MouseBtn, RmSw, RmPrev, RmNext, RmMid, RmReset, RmBadge, RmRow, RmModel, RmRec,
         BattBtn, BtDropSw, BtToastSw, BtBootSw, BtPreview,
+        ArtyBtn, ArPos, ArTgt, ArAdd, ArRow, ArRowX, ArTable, ArTabField, ArTabAdd, ArTabX,
         LinkDoc, LinkRepo
     }
 
@@ -1204,7 +1271,6 @@ namespace PurpleClicker
 
         // Eine Box fuer alles rund um den Autoclicker: links Intervall, rechts Maustaste / Klick-Art / Hotkey
         static readonly Rectangle R_CardAuto = new Rectangle(20, 64, 660, 186);
-        static readonly Rectangle R_CardInt = new Rectangle(20, 64, 338, 186);   // linke Haelfte (Mausrad aendert das Intervall)
         const int AUTO_DIV_X = 358, AUTO_LBL_X = 382, AUTO_LBL_W = 96;
         static readonly Rectangle R_Minus = new Rectangle(34, 122, 36, 36);
         static readonly Rectangle R_Plus = new Rectangle(300, 122, 36, 36);
@@ -1222,8 +1288,22 @@ namespace PurpleClicker
         static readonly Rectangle R_HotBtn = new Rectangle(582, 200, 76, 28);
 
         // Autostart sitzt in der Titelleiste
-        static readonly Rectangle R_AutoHit = new Rectangle(322, 13, 158, 30);
-        static readonly Rectangle R_AutoSw = new Rectangle(436, 16, 44, 24);
+        static readonly Rectangle R_AutoHit = new Rectangle(300, 13, 142, 30);
+        static readonly Rectangle R_AutoSw = new Rectangle(398, 16, 44, 24);
+        // Artillerie-Seite: links Felder + Ergebnis, rechts Zielliste, unten Knopf fuer die Schusstafel
+        static readonly Rectangle R_ArtyBtn = new Rectangle(460, 13, 30, 30);
+        static readonly Rectangle R_ArCard = new Rectangle(20, 64, 660, 374);
+        static readonly Rectangle R_ArPos = new Rectangle(118, 98, 302, 36);
+        static readonly Rectangle R_ArTgt = new Rectangle(118, 142, 302, 36);
+        const int AR_TILE_Y = 210, AR_TILE_H = 96, AR_TILE_W = 122, AR_TILE_GAP = 9;
+        const int AR_DIV_X = 436, AR_LIST_X = 452, AR_LIST_W = 212;
+        static readonly Rectangle R_ArAdd = new Rectangle(452, 98, 212, 30);
+        const int AR_ROW_Y0 = 138, AR_ROW = 34, AR_ROW_H = 30, AR_MAX = 8;
+        // Schusstafel-Popup (gleiche Flaeche wie die Programm-Auswahl)
+        static readonly Rectangle R_ArTabField = new Rectangle(130, 100, 300, 34);
+        static readonly Rectangle R_ArTabAdd = new Rectangle(440, 100, 130, 34);
+        static readonly Rectangle R_ArTabList = new Rectangle(130, 146, 440, 186);
+        const int AR_TAB_ROW = 31, AR_TAB_ROWS = 6;
         // Akku-Seite
         static readonly Rectangle R_BattBtn = new Rectangle(498, 13, 30, 30);
         static readonly Rectangle R_BtCard = new Rectangle(20, 64, 660, 374);
@@ -1488,7 +1568,7 @@ namespace PurpleClicker
 
         Hotkey hotkey = new Hotkey(false, (int)Keys.F6);
         readonly Remapper remap = new Remapper();   // Maus-Umbelegung
-        int page;                                   // 0 = Hauptseite, 1 = Maus-Umbelegung, 2 = Akku
+        int page;                                   // 0 = Hauptseite, 1 = Maus-Umbelegung, 2 = Akku, 3 = Artillerie
         int rmSel = -1;                             // im Mausbild gewaehlte Eingabe
         int mouseView;                              // 0 Auto, 1 Foto, 2 gezeichnet (5 Tasten), 3 gezeichnet (3 Tasten)
         Bitmap mousePhoto;                          // aus der exe, null wenn nicht eingebettet
@@ -1550,6 +1630,18 @@ namespace PurpleClicker
         static readonly int[] Steps = { 70, 50, 30, 20, 10 };
         const int BattMsgSec = 12;        // Anzeigedauer der Akku-Meldungen, unabhaengig vom Schieber "MELDUNG"
         const int ToastSec = 6;           // Anzeigedauer der Windows-Benachrichtigung bei 30/10 %
+
+        // Artillerie-Rechner
+        readonly string[] arText = { "", "", "" };                        // Feldinhalt: 0 Position, 1 Ziel, 2 Tafel-Eingabe
+        readonly double[] arX = { double.NaN, double.NaN }, arY = { double.NaN, double.NaN };
+        double arOldX, arOldY;            // Wert beim Betreten des Feldes (Esc / ungueltige Eingabe)
+        int arFocus = -1;                 // Feld mit Eingabe, -1 = keins
+        bool arSelAll;                    // Inhalt markiert: Tippen ersetzt ihn
+        string arErr = "";
+        readonly List<ArTarget> arTargets = new List<ArTarget>();
+        readonly List<int[]> arTable = new List<int[]>();                 // Schusstafel {m, Mil}, nach Entfernung sortiert
+        bool arTabOpen;
+        int arTabScroll;
 
         public MainForm(bool hidden, bool noServices)
         {
@@ -2380,6 +2472,194 @@ namespace PurpleClicker
             Invalidate();
         }
 
+        // ---------------------------------------------------------- Artillerie-Rechner
+        static Hit ArFieldHit(int i)
+        {
+            return i == 0 ? Hit.ArPos : i == 1 ? Hit.ArTgt : Hit.ArTabField;
+        }
+
+        string ArShow(int i)
+        {
+            return double.IsNaN(arX[i]) ? "" : Arty.Coord(arX[i], arY[i]);
+        }
+
+        void ArFocus(int i)
+        {
+            if (arFocus == i) { arSelAll = false; return; }   // zweiter Klick: Markierung aufheben, weiterschreiben
+            ArBlur();
+            arFocus = i;
+            arSelAll = arText[i].Length > 0;
+            arErr = "";
+            if (i < 2) { arOldX = arX[i]; arOldY = arY[i]; }
+            Focus();
+        }
+
+        // Feld verlassen: Koordinate uebernehmen, leer = keine, ungueltig = alter Wert bleibt
+        void ArBlur()
+        {
+            int i = arFocus;
+            if (i < 0) return;
+            arFocus = -1;
+            arSelAll = false;
+            if (i == 2) return;
+            double x, y;
+            if (arText[i].Trim().Length == 0) { arX[i] = double.NaN; arY[i] = double.NaN; }
+            else if (Arty.Parse(arText[i], out x, out y)) { arX[i] = x; arY[i] = y; }
+            else
+            {
+                arX[i] = arOldX;
+                arY[i] = arOldY;
+                arErr = "Keine Koordinate erkannt, z. B. x77.11, y75.32";
+            }
+            arText[i] = ArShow(i);
+            SaveSettings();
+        }
+
+        void ArCancel()
+        {
+            int i = arFocus;
+            arFocus = -1;
+            arSelAll = false;
+            arErr = "";
+            if (i < 0 || i == 2) return;
+            arX[i] = arOldX;
+            arY[i] = arOldY;
+            arText[i] = ArShow(i);
+        }
+
+        // Waehrend des Tippens rechnen, sobald zwei Zahlen dastehen
+        void ArLive()
+        {
+            if (arFocus < 0 || arFocus == 2) return;
+            double x, y;
+            if (Arty.Parse(arText[arFocus], out x, out y)) { arX[arFocus] = x; arY[arFocus] = y; }
+        }
+
+        // Strg+V: ersetzt den Inhalt und uebernimmt die Koordinate sofort
+        void ArPaste(int i, string clip)
+        {
+            clip = (clip ?? "").Replace('\r', ' ').Replace('\n', ' ').Trim();
+            if (clip.Length > 40) clip = clip.Substring(0, 40);
+            if (i == 2)
+            {
+                if (arFocus != 2) ArFocus(2);
+                if (arSelAll) arText[2] = "";
+                arSelAll = false;
+                arText[2] = (arText[2] + clip).Length > 40 ? arText[2] : arText[2] + clip;
+                return;
+            }
+            double x, y;
+            if (!Arty.Parse(clip, out x, out y))
+            {
+                arErr = "Zwischenablage enthält keine Koordinate";
+                return;
+            }
+            if (arFocus != i) ArBlur();
+            arFocus = -1;
+            arSelAll = false;
+            arX[i] = x;
+            arY[i] = y;
+            arText[i] = ArShow(i);
+            arErr = "";
+            SaveSettings();
+        }
+
+        bool ArKey(Keys k, Keys mod)
+        {
+            if (k == Keys.V && mod == Keys.Control)
+            {
+                string clip = "";
+                try { if (Clipboard.ContainsText()) clip = Clipboard.GetText(); } catch { }
+                ArPaste(arFocus >= 0 ? arFocus : (arTabOpen ? 2 : 1), clip);   // ohne Feld: ins Ziel
+                return true;
+            }
+            if (arFocus >= 0)
+            {
+                if (k == Keys.Back)
+                {
+                    string s = arText[arFocus];
+                    arText[arFocus] = arSelAll ? "" : s.Length > 0 ? s.Substring(0, s.Length - 1) : s;
+                    arSelAll = false;
+                    arErr = "";
+                    ArLive();
+                    return true;
+                }
+                if (k == Keys.Enter) { if (arFocus == 2) ArAddTableEntry(); else ArBlur(); return true; }
+                if (k == Keys.Escape)
+                {
+                    if (arFocus == 2) arTabOpen = false;   // in der Tafel schliesst Esc das Popup direkt
+                    ArCancel();
+                    return true;
+                }
+                if (k == Keys.Tab && arFocus < 2) { ArFocus(1 - arFocus); return true; }
+                return false;   // Zeichen kommen ueber OnKeyPress
+            }
+            if (k == Keys.Tab && !arTabOpen) { ArFocus(0); return true; }
+            if (k == Keys.Escape)
+            {
+                if (arTabOpen) arTabOpen = false; else page = 0;
+                arErr = "";
+                return true;
+            }
+            return false;
+        }
+
+        void ArAddTarget()
+        {
+            if (double.IsNaN(arX[1]) || arTargets.Count >= AR_MAX) return;
+            int no = 0;
+            foreach (ArTarget t in arTargets)
+            {
+                if (t.X == arX[1] && t.Y == arY[1]) return;   // schon in der Liste
+                no = Math.Max(no, t.No);
+            }
+            arTargets.Add(new ArTarget(no + 1, arX[1], arY[1]));
+            SaveSettings();
+        }
+
+        // Tafel oeffnen; aktuelle Entfernung steht schon im Feld, es fehlt nur noch der Mil-Wert
+        void ArOpenTable()
+        {
+            arTabOpen = true;
+            arErr = "";
+            ArFocus(2);
+            arSelAll = false;
+            double d;
+            arText[2] = ArDistance(out d) ? Math.Round(d) + " " : "";
+        }
+
+        void ArAddTableEntry()
+        {
+            double a, b;
+            if (!Arty.Parse(arText[2], out a, out b))
+            {
+                arErr = "Entfernung und Mil mit Leerzeichen, z. B. 450 1250";
+                return;
+            }
+            int d = (int)Math.Round(a), m = (int)Math.Round(b);
+            if (d < 1 || d > 20000 || m > 6400)
+            {
+                arErr = "Werte außerhalb des sinnvollen Bereichs";
+                return;
+            }
+            arTable.RemoveAll(delegate(int[] e) { return e[0] == d; });   // gleiche Entfernung: ueberschreiben
+            arTable.Add(new int[] { d, m });
+            arTable.Sort(delegate(int[] p, int[] q) { return p[0].CompareTo(q[0]); });
+            arText[2] = "";
+            arErr = "";
+            arFocus = 2;
+            arSelAll = false;
+            SaveSettings();
+        }
+
+        bool ArDistance(out double d)
+        {
+            d = 0;
+            if (double.IsNaN(arX[0]) || double.IsNaN(arX[1])) return false;
+            d = Arty.Distance(arX[0], arY[0], arX[1], arY[1]);
+            return true;
+        }
+
         // ---------------------------------------------------------- Eingabe
         Point Logical(Point p)
         {
@@ -2405,10 +2685,12 @@ namespace PurpleClicker
             if (page == 0 && !popupOpen && R_AutoHit.Contains(p)) return Hit.AutoSw;
             if (R_MouseBtn.Contains(p)) return Hit.MouseBtn;
             if (R_BattBtn.Contains(p)) return Hit.BattBtn;
+            if (R_ArtyBtn.Contains(p)) return Hit.ArtyBtn;
             if (linkDocRect.Contains(p)) return Hit.LinkDoc;
             if (linkRepoRect.Contains(p)) return Hit.LinkRepo;
             if (R_Title.Contains(p)) return Hit.Drag;
             if (page == 1) return HitRemap(p);
+            if (page == 3) return HitArty(p);
             if (page == 2)
             {
                 if (R_BtDropSw.Contains(p)) return Hit.BtDropSw;
@@ -2539,6 +2821,34 @@ namespace PurpleClicker
             return Hit.None;
         }
 
+        Hit HitArty(Point p)
+        {
+            if (arTabOpen)
+            {
+                if (R_ArTabField.Contains(p)) return Hit.ArTabField;
+                if (R_ArTabAdd.Contains(p)) return Hit.ArTabAdd;
+                if (R_ArTabList.Contains(p))
+                {
+                    int i = arTabScroll + (p.Y - R_ArTabList.Y) / AR_TAB_ROW;
+                    if (i < arTable.Count && p.X >= R_ArTabList.Right - 34) { hitIndex = i; return Hit.ArTabX; }
+                    return Hit.PopPanel;
+                }
+                return R_Pop.Contains(p) ? Hit.PopPanel : Hit.PopOutside;
+            }
+            if (R_ArPos.Contains(p)) return Hit.ArPos;
+            if (R_ArTgt.Contains(p)) return Hit.ArTgt;
+            if (R_ArAdd.Contains(p)) return Hit.ArAdd;
+            if (R_Start.Contains(p)) return Hit.ArTable;
+            for (int i = 0; i < arTargets.Count; i++)
+            {
+                Rectangle r = new Rectangle(AR_LIST_X, AR_ROW_Y0 + i * AR_ROW, AR_LIST_W, AR_ROW_H);
+                if (!r.Contains(p)) continue;
+                hitIndex = i;
+                return p.X >= r.Right - 28 ? Hit.ArRowX : Hit.ArRow;
+            }
+            return Hit.None;
+        }
+
         void DurTo(int x)
         {
             double t = (x - DUR_X) / (double)DUR_W;
@@ -2575,6 +2885,7 @@ namespace PurpleClicker
 
             if (capturing && h != (capTarget == 0 ? Hit.HotChange : Hit.MulKey)) { capturing = false; Invalidate(); }
             if (editing && h != Hit.Number) CommitEdit();
+            if (arFocus >= 0 && h != ArFieldHit(arFocus) && !(arFocus == 2 && h == Hit.ArTabAdd)) ArBlur();
 
             switch (h)
             {
@@ -2610,6 +2921,40 @@ namespace PurpleClicker
                     if (page == 2 && servicesStarted) Battery.Poke(0);   // frische Werte holen
                     popupOpen = false;
                     themeOpen = false;
+                    break;
+                case Hit.ArtyBtn:
+                    EndRecording(false);
+                    page = page == 3 ? 0 : 3;
+                    popupOpen = false;
+                    themeOpen = false;
+                    arTabOpen = false;
+                    break;
+                case Hit.ArPos: ArFocus(0); break;
+                case Hit.ArTgt: ArFocus(1); break;
+                case Hit.ArTabField: ArFocus(2); break;
+                case Hit.ArAdd: ArAddTarget(); break;
+                case Hit.ArRow:
+                    if (idx >= 0 && idx < arTargets.Count)
+                    {
+                        arX[1] = arTargets[idx].X;
+                        arY[1] = arTargets[idx].Y;
+                        arText[1] = ArShow(1);
+                        arErr = "";
+                        SaveSettings();
+                    }
+                    break;
+                case Hit.ArRowX:
+                    if (idx >= 0 && idx < arTargets.Count) { arTargets.RemoveAt(idx); SaveSettings(); }
+                    break;
+                case Hit.ArTable: ArOpenTable(); break;
+                case Hit.ArTabAdd: ArAddTableEntry(); break;
+                case Hit.ArTabX:
+                    if (idx >= 0 && idx < arTable.Count)
+                    {
+                        arTable.RemoveAt(idx);
+                        arTabScroll = Math.Min(arTabScroll, Math.Max(0, arTable.Count - AR_TAB_ROWS));
+                        SaveSettings();
+                    }
                     break;
                 case Hit.BtDropSw: battDropMsg = !battDropMsg; SaveSettings(); break;
                 case Hit.BtToastSw:
@@ -2702,7 +3047,7 @@ namespace PurpleClicker
                         ForegroundTick();
                     }
                     break;
-                case Hit.PopOutside: popupOpen = false; break;
+                case Hit.PopOutside: popupOpen = false; arTabOpen = false; break;
             }
             hover = HitTest(p);
             hoverIdx = hitIndex;
@@ -2724,7 +3069,8 @@ namespace PurpleClicker
                 hoverIdx = idx;
                 bool hand = h != Hit.None && h != Hit.Drag && h != Hit.PopPanel && h != Hit.PopOutside
                     && h != Hit.ThemePanel && h != Hit.ThemeOutside;
-                Cursor = hand ? Cursors.Hand : Cursors.Default;
+                bool text = h == Hit.ArPos || h == Hit.ArTgt || h == Hit.ArTabField;
+                Cursor = text ? Cursors.IBeam : hand ? Cursors.Hand : Cursors.Default;
                 Invalidate();
             }
         }
@@ -2747,15 +3093,22 @@ namespace PurpleClicker
         protected override void OnMouseWheel(MouseEventArgs e)
         {
             base.OnMouseWheel(e);
+            if (page == 3)
+            {
+                if (arTabOpen)
+                {
+                    int max = Math.Max(0, arTable.Count - AR_TAB_ROWS);
+                    arTabScroll = Math.Min(max, Math.Max(0, arTabScroll + (e.Delta > 0 ? -1 : 1)));
+                    Invalidate();
+                }
+                return;
+            }
             if (popupOpen)
             {
                 int max = Math.Max(0, popItems.Count - POP_ROWS);
                 popScroll = Math.Min(max, Math.Max(0, popScroll + (e.Delta > 0 ? -1 : 1)));
                 Invalidate();
-                return;
             }
-            if (R_CardInt.Contains(Logical(e.Location)))
-                StepInterval(e.Delta > 0 ? 1 : -1);
         }
 
         protected override void OnDeactivate(EventArgs e)
@@ -2764,9 +3117,37 @@ namespace PurpleClicker
             EndRecording(false);   // sonst wuerde die Aufnahme global Tasten schlucken
         }
 
+        // Tab soll auf der Artillerie-Seite in OnKeyDown ankommen (Wechsel Position <-> Ziel)
+        protected override bool ProcessDialogKey(Keys keyData)
+        {
+            if (page == 3 && (keyData & Keys.KeyCode) == Keys.Tab) return false;
+            return base.ProcessDialogKey(keyData);
+        }
+
+        protected override void OnKeyPress(KeyPressEventArgs e)
+        {
+            base.OnKeyPress(e);
+            if (page != 3 || themeOpen || arFocus < 0) return;
+            char c = e.KeyChar;
+            bool ok = (c >= '0' && c <= '9') || c == '.' || c == ',' || c == ' ' || (arFocus < 2 && "xXyY:;/".IndexOf(c) >= 0);
+            if (!ok) return;
+            if (arSelAll) { arText[arFocus] = ""; arSelAll = false; }
+            if (arText[arFocus].Length < 40) arText[arFocus] += c;
+            arErr = "";
+            ArLive();
+            Invalidate();
+            e.Handled = true;
+        }
+
         protected override void OnKeyDown(KeyEventArgs e)
         {
             base.OnKeyDown(e);
+            if (page == 3 && !themeOpen && ArKey(e.KeyCode, e.Modifiers))
+            {
+                Invalidate();
+                e.Handled = true;
+                return;
+            }
             if ((page == 1 || page == 2) && !themeOpen && e.KeyCode == Keys.Escape)
             {
                 page = 0;
@@ -3143,9 +3524,16 @@ namespace PurpleClicker
             DrawGear(g, hover == Hit.Gear || themeOpen);
             DrawMouseIcon(g, hover == Hit.MouseBtn);
             DrawBattIcon(g, hover == Hit.BattBtn);
-            if (page == 1 || page == 2)
+            DrawArtyIcon(g, hover == Hit.ArtyBtn);
+            if (page != 0)
             {
-                if (page == 1) DrawRemapPage(g); else DrawBatteryPage(g);
+                if (page == 1) DrawRemapPage(g);
+                else if (page == 2) DrawBatteryPage(g);
+                else
+                {
+                    DrawArtyPage(g);
+                    if (arTabOpen) DrawArtyTable(g);
+                }
                 if (themeOpen) DrawThemeMenu(g);
                 return;
             }
@@ -3326,6 +3714,241 @@ namespace PurpleClicker
                 g.FillRectangle(b, body.Right + 1f, cy - 2.5f, 2f, 5f);
                 if (low > 0) g.FillRectangle(b, body.X + 2.5f, body.Y + 2.5f, (body.Width - 5f) * low / 100f, body.Height - 5f);
             }
+        }
+
+        // Fadenkreuz in der Titelleiste (oeffnet den Artillerie-Rechner)
+        void DrawArtyIcon(Graphics g, bool hot)
+        {
+            BtnShape(g, hot || page == 3 ? C_BtnHover : C_Btn, R_ArtyBtn);
+            float cx = R_ArtyBtn.X + R_ArtyBtn.Width / 2f, cy = R_ArtyBtn.Y + R_ArtyBtn.Height / 2f;
+            Color c = page == 3 ? C_Accent : C_Text;
+            using (Pen pen = new Pen(c, 1.6f))
+            {
+                pen.StartCap = LineCap.Round;
+                pen.EndCap = LineCap.Round;
+                g.DrawEllipse(pen, cx - 6f, cy - 6f, 12f, 12f);
+                g.DrawLine(pen, cx, cy - 9.5f, cx, cy - 3.5f);
+                g.DrawLine(pen, cx, cy + 3.5f, cx, cy + 9.5f);
+                g.DrawLine(pen, cx - 9.5f, cy, cx - 3.5f, cy);
+                g.DrawLine(pen, cx + 3.5f, cy, cx + 9.5f, cy);
+            }
+            using (SolidBrush b = new SolidBrush(c))
+                g.FillEllipse(b, cx - 1.3f, cy - 1.3f, 2.6f, 2.6f);
+        }
+
+        // Eingabefeld des Rechners: markierter Inhalt, Schreibmarke, Platzhalter
+        void ArField(Graphics g, int i, Rectangle r, string label, string placeholder)
+        {
+            if (label != null)
+                DrawText(g, label, fLabel, C_Dim, new Rectangle(36, r.Y, r.X - 40, r.Height), StringAlignment.Near);
+            bool focus = arFocus == i;
+            float rad = RadCtl(r.Height);
+            FillRR(g, C_Field, r, rad);
+            StrokeRR(g, focus ? C_Accent : hover == ArFieldHit(i) ? C_Dim : C_CardLine, r, rad, focus ? 1.5f : 1f);
+            string s = arText[i];
+            Rectangle inner = new Rectangle(r.X + 14, r.Y, r.Width - 28, r.Height);
+            if (s.Length == 0 && !focus)
+            {
+                DrawText(g, placeholder, fChip, C_Dim, inner, StringAlignment.Near);
+                return;
+            }
+            using (StringFormat sf = (StringFormat)StringFormat.GenericTypographic.Clone())
+            using (SolidBrush b = new SolidBrush(C_Text))
+            {
+                sf.FormatFlags |= StringFormatFlags.MeasureTrailingSpaces | StringFormatFlags.NoWrap;
+                float th = g.MeasureString("x0", fTitle, 2000, sf).Height;
+                float tw = s.Length > 0 ? g.MeasureString(s, fTitle, 2000, sf).Width : 0f;
+                float ty = r.Y + (r.Height - th) / 2f;
+                g.SetClip(inner);
+                if (focus && arSelAll && tw > 0)
+                    using (SolidBrush sel = new SolidBrush(A(90, C_Accent)))
+                        g.FillRectangle(sel, inner.X - 2, ty - 1, tw + 4, th + 2);
+                g.DrawString(s, fTitle, b, inner.X, ty, sf);
+                if (focus && !arSelAll)
+                    using (Pen caret = new Pen(C_Accent, 1.5f))
+                        g.DrawLine(caret, inner.X + tw + 1.5f, ty + 1, inner.X + tw + 1.5f, ty + th - 1);
+                g.ResetClip();
+            }
+        }
+
+        // Ergebnis-Kachel: Label, grosse Zahl mit Einheit, Zusatzzeile
+        void ArTile(Graphics g, int n, string label, string value, string unit, string sub, Color valueColor, Color subColor)
+        {
+            Rectangle r = new Rectangle(36 + n * (AR_TILE_W + AR_TILE_GAP), AR_TILE_Y, AR_TILE_W, AR_TILE_H);
+            float rad = Math.Min(RadCtl(r.Height), 12f);
+            FillRR(g, C_Field, r, rad);
+            StrokeRR(g, C_CardLine, r, rad, 1f);
+            DrawText(g, label, fLabel, C_Dim, new Rectangle(r.X + 12, r.Y + 8, r.Width - 16, 18), StringAlignment.Near);
+            Font f = fBig;
+            SizeF vs = g.MeasureString(value, f, 2000, StringFormat.GenericTypographic);
+            SizeF us = g.MeasureString(unit, fUnit, 2000, StringFormat.GenericTypographic);
+            if (vs.Width + 4 + us.Width > r.Width - 22)
+            {
+                f = fTitle;   // sehr lange Zahl: kleinere Schrift statt ueber den Rand
+                vs = g.MeasureString(value, f, 2000, StringFormat.GenericTypographic);
+            }
+            float bigH = g.MeasureString("0", fBig, 2000, StringFormat.GenericTypographic).Height;
+            float vx = r.X + 12, vy = r.Y + 28 + (bigH - vs.Height) / 2f;
+            using (SolidBrush b = new SolidBrush(valueColor))
+                g.DrawString(value, f, b, vx, vy, StringFormat.GenericTypographic);
+            if (unit.Length > 0)
+                using (SolidBrush b = new SolidBrush(C_Dim))
+                    g.DrawString(unit, fUnit, b, vx + vs.Width + 4, vy + vs.Height - us.Height - 4, StringFormat.GenericTypographic);
+            DrawText(g, sub, fChip, subColor, new Rectangle(r.X + 12, r.Bottom - 26, r.Width - 16, 18), StringAlignment.Near);
+        }
+
+        // Artillerie-Seite: Position/Ziel einfuegen, Entfernung, Richtung, Erhoehung aus der eigenen Schusstafel
+        void DrawArtyPage(Graphics g)
+        {
+            Card(g, R_ArCard, "ARTILLERIE · MÖRSER L81");
+            ArField(g, 0, R_ArPos, "POSITION", "Strg+V oder tippen, z. B. x77.11, y75.32");
+            ArField(g, 1, R_ArTgt, "ZIEL", "Strg+V oder tippen");
+            if (arErr.Length > 0 && !arTabOpen)
+                DrawText(g, arErr, fChip, DevIcons.Level(0), new Rectangle(118, 182, 302, 20), StringAlignment.Near);
+            else
+                DrawText(g, "Feld anklicken, Strg+V  ·  Tab wechselt", fChip, C_Dim, new Rectangle(118, 182, 302, 20), StringAlignment.Near);
+
+            Color red = DevIcons.Level(0), green = DevIcons.Level(100);
+            double dist;
+            bool ok = ArDistance(out dist);
+            bool inRange = ok && dist >= Arty.MinRange && dist <= Arty.MaxRange;
+            if (ok)
+            {
+                double deg = Arty.Bearing(arX[0], arY[0], arX[1], arY[1]);
+                double elev = Arty.Elevation(arTable, dist);
+                string dx = (arX[1] - arX[0]).ToString("+0.00;−0.00;0.00", CultureInfo.InvariantCulture);
+                string dy = (arY[1] - arY[0]).ToString("+0.00;−0.00;0.00", CultureInfo.InvariantCulture);
+                ArTile(g, 0, "ENTFERNUNG", Math.Round(dist).ToString(CultureInfo.InvariantCulture), "m", "Δ " + dx + " / " + dy,
+                    inRange ? C_Text : red, C_Dim);
+                ArTile(g, 1, "RICHTUNG", deg.ToString("0.0", CultureInfo.InvariantCulture), "°",
+                    Arty.Compass(deg) + " · " + Math.Round(Arty.ToMil(deg)) % 6400 + " mil", C_Text, C_Dim);
+                string esub = arTable.Count == 0 ? "Schusstafel leer" : double.IsNaN(elev) ? "außerhalb der Tafel" : "aus Schusstafel";
+                ArTile(g, 2, "ERHÖHUNG", double.IsNaN(elev) ? "–" : Math.Round(elev).ToString(CultureInfo.InvariantCulture), "mil", esub,
+                    double.IsNaN(elev) ? C_Dim : C_Accent, C_Dim);
+            }
+            else
+            {
+                ArTile(g, 0, "ENTFERNUNG", "–", "m", "", C_Dim, C_Dim);
+                ArTile(g, 1, "RICHTUNG", "–", "°", "", C_Dim, C_Dim);
+                ArTile(g, 2, "ERHÖHUNG", "–", "mil", "", C_Dim, C_Dim);
+            }
+
+            // Reichweite
+            string rangeText = !ok ? "Position und Ziel eingeben"
+                : inRange ? "In Reichweite (L81 ca. " + Arty.MinRange + "–" + Arty.MaxRange + " m)"
+                : (dist > Arty.MaxRange ? "Zu weit" : "Zu nah") + " für den L81 (ca. " + Arty.MinRange + "–" + Arty.MaxRange + " m)";
+            if (ok)
+                using (SolidBrush b = new SolidBrush(inRange ? green : red))
+                    g.FillEllipse(b, 37, 322, 8, 8);
+            DrawText(g, rangeText, fBtn, ok ? (inRange ? C_Text : red) : C_Dim, new Rectangle(ok ? 52 : 36, 316, 370, 20), StringAlignment.Near);
+
+            // Stand der Schusstafel
+            string tab = arTable.Count == 0 ? "Schusstafel: noch leer"
+                : "Schusstafel: " + arTable.Count + (arTable.Count == 1 ? " Eintrag" : " Einträge") + ", "
+                  + arTable[0][0] + "–" + arTable[arTable.Count - 1][0] + " m";
+            DrawText(g, tab, fChip, C_Text, new Rectangle(36, 356, 384, 18), StringAlignment.Near);
+            DrawText(g, "Nach Probeschüssen eintragen, dazwischen wird gerechnet", fChip, C_Dim,
+                new Rectangle(36, 376, 384, 18), StringAlignment.Near);
+
+            // Zielliste rechts
+            using (Pen sep = new Pen(C_CardLine, 1f))
+                g.DrawLine(sep, AR_DIV_X, R_ArCard.Y + 18, AR_DIV_X, R_ArCard.Bottom - 18);
+            DrawText(g, "ZIELE", fLabel, C_Dim, new Rectangle(AR_LIST_X, R_ArCard.Y + 8, 100, 20), StringAlignment.Near);
+            DrawText(g, arTargets.Count + " / " + AR_MAX, fChip, C_Dim, new Rectangle(AR_LIST_X, R_ArCard.Y + 8, AR_LIST_W, 20), StringAlignment.Far);
+            bool full = arTargets.Count >= AR_MAX;
+            bool canAdd = !double.IsNaN(arX[1]) && !full;
+            bool addHot = hover == Hit.ArAdd && canAdd;
+            FillRR(g, addHot ? A(36, C_Accent) : C_Field, R_ArAdd, RadCtl(R_ArAdd.Height));
+            StrokeRR(g, canAdd ? C_Accent : C_CardLine, R_ArAdd, RadCtl(R_ArAdd.Height), 1f);
+            DrawText(g, full ? "Liste voll" : "+  Ziel speichern", fChip, canAdd ? C_Accent : C_Dim, R_ArAdd, StringAlignment.Center);
+            if (arTargets.Count == 0)
+                DrawText(g, "Noch keine Ziele gespeichert", fChip, C_Dim,
+                    new Rectangle(AR_LIST_X, AR_ROW_Y0, AR_LIST_W, AR_ROW_H), StringAlignment.Center);
+            for (int i = 0; i < arTargets.Count; i++)
+            {
+                ArTarget t = arTargets[i];
+                Rectangle row = new Rectangle(AR_LIST_X, AR_ROW_Y0 + i * AR_ROW, AR_LIST_W, AR_ROW_H);
+                bool cur = t.X == arX[1] && t.Y == arY[1];
+                bool hot = (hover == Hit.ArRow || hover == Hit.ArRowX) && hoverIdx == i;
+                float rr = Math.Min(RadCtl(row.Height), 10f);
+                FillRR(g, cur ? A(40, C_Accent) : hot ? C_BtnHover : C_Btn, row, rr);
+                if (cur) StrokeRR(g, A(120, C_Accent), row, rr, 1f);
+                DrawText(g, "Ziel " + t.No, fBtn, cur ? C_Accent : C_Text, new Rectangle(row.X + 12, row.Y, 58, row.Height), StringAlignment.Near);
+                string info = double.IsNaN(arX[0]) ? Arty.Coord(t.X, t.Y)
+                    : Math.Round(Arty.Distance(arX[0], arY[0], t.X, t.Y)) + " m · "
+                      + Math.Round(Arty.Bearing(arX[0], arY[0], t.X, t.Y)) % 360 + "°";
+                DrawText(g, info, fChip, C_Dim, new Rectangle(row.X + 70, row.Y, row.Width - 100, row.Height), StringAlignment.Near);
+                bool xh = hover == Hit.ArRowX && hoverIdx == i;
+                Rectangle xr = new Rectangle(row.Right - 24, row.Y + 6, 18, 18);
+                if (xh) using (SolidBrush b = new SolidBrush(Color.FromArgb(60, 60, 60))) g.FillEllipse(b, xr);
+                using (Pen pen = new Pen(xh ? Color.White : C_Dim, 1.4f))
+                {
+                    pen.StartCap = LineCap.Round;
+                    pen.EndCap = LineCap.Round;
+                    g.DrawLine(pen, xr.X + 6, xr.Y + 6, xr.X + 12, xr.Y + 12);
+                    g.DrawLine(pen, xr.X + 12, xr.Y + 6, xr.X + 6, xr.Y + 12);
+                }
+            }
+
+            FillRR(g, hover == Hit.ArTable ? C_BtnHover : C_Btn, R_Start, radStart);
+            StrokeRR(g, C_CardLine, R_Start, radStart, 1f);
+            DrawText(g, "Schusstafel bearbeiten", fBtn, C_Text, R_Start, StringAlignment.Center);
+        }
+
+        // Schusstafel-Popup: Eingabe "Entfernung Mil", Liste mit Loeschen
+        void DrawArtyTable(Graphics g)
+        {
+            using (SolidBrush b = new SolidBrush(Color.FromArgb(200, 0, 0, 0)))
+                g.FillRectangle(b, 0, 56, W, H - 56);
+            FillRR(g, A(255, C_Card), R_Pop, Math.Min(radCard, 16f));
+            StrokeRR(g, C_Accent, R_Pop, Math.Min(radCard, 16f), 1f);
+            DrawText(g, "SCHUSSTAFEL L81  ·  ENTFERNUNG → MIL", fLabel, C_Dim, new Rectangle(R_Pop.X + 20, R_Pop.Y + 10, 400, 28), StringAlignment.Near);
+
+            ArField(g, 2, R_ArTabField, null, "z. B. 450 1250");
+            bool addHot = hover == Hit.ArTabAdd;
+            FillRR(g, addHot ? A(36, C_Accent) : C_Field, R_ArTabAdd, RadCtl(R_ArTabAdd.Height));
+            StrokeRR(g, C_Accent, R_ArTabAdd, RadCtl(R_ArTabAdd.Height), 1f);
+            DrawText(g, "Eintragen", fBtn, C_Accent, R_ArTabAdd, StringAlignment.Center);
+
+            // Eintraege, zwischen denen die aktuelle Entfernung liegt, hervorheben
+            double dist;
+            int lo = -1, hi = -1;
+            if (ArDistance(out dist))
+                for (int i = 0; i < arTable.Count; i++)
+                {
+                    if (arTable[i][0] <= dist) lo = i;
+                    if (arTable[i][0] >= dist && hi < 0) hi = i;
+                }
+            if (lo < 0 || hi < 0) lo = hi = -1;
+
+            if (arTable.Count == 0)
+                DrawText(g, "Noch keine Einträge – nach einem Probeschuss Entfernung und Mil eintragen", fChip, C_Dim, R_ArTabList, StringAlignment.Center);
+            for (int row = 0; row < AR_TAB_ROWS; row++)
+            {
+                int i = arTabScroll + row;
+                if (i >= arTable.Count) break;
+                Rectangle r = new Rectangle(R_ArTabList.X, R_ArTabList.Y + row * AR_TAB_ROW, R_ArTabList.Width, AR_TAB_ROW - 4);
+                bool used = i == lo || i == hi;
+                FillRR(g, used ? A(40, C_Accent) : C_Btn, r, 8);
+                DrawText(g, arTable[i][0] + " m", fBtn, C_Text, new Rectangle(r.X + 14, r.Y, 100, r.Height), StringAlignment.Near);
+                DrawText(g, "→", fBtn, C_Dim, new Rectangle(r.X + 116, r.Y, 30, r.Height), StringAlignment.Center);
+                DrawText(g, arTable[i][1] + " mil", fBtn, used ? C_Accent : C_Text, new Rectangle(r.X + 156, r.Y, 120, r.Height), StringAlignment.Near);
+                bool xh = hover == Hit.ArTabX && hoverIdx == i;
+                Rectangle xr = new Rectangle(r.Right - 26, r.Y + (r.Height - 18) / 2, 18, 18);
+                if (xh) using (SolidBrush b = new SolidBrush(Color.FromArgb(60, 60, 60))) g.FillEllipse(b, xr);
+                using (Pen pen = new Pen(xh ? Color.White : C_Dim, 1.4f))
+                {
+                    pen.StartCap = LineCap.Round;
+                    pen.EndCap = LineCap.Round;
+                    g.DrawLine(pen, xr.X + 6, xr.Y + 6, xr.X + 12, xr.Y + 12);
+                    g.DrawLine(pen, xr.X + 12, xr.Y + 6, xr.X + 6, xr.Y + 12);
+                }
+            }
+
+            string hint = arErr.Length > 0 ? arErr
+                : "Enter = eintragen  ·  gleiche Entfernung überschreibt  ·  " + (arTable.Count > AR_TAB_ROWS ? "Mausrad = scrollen  ·  " : "") + "Esc = schließen";
+            DrawText(g, hint, fChip, arErr.Length > 0 ? DevIcons.Level(0) : C_Dim,
+                new Rectangle(R_Pop.X + 20, R_Pop.Bottom - 26, R_Pop.Width - 40, 20), StringAlignment.Far);
         }
 
         // Akku-Seite: Stand der Geraete + Schalter fuer die Meldungen
@@ -3698,6 +4321,40 @@ namespace PurpleClicker
                         case "BattToastMsg": battToastMsg = v != 0; break;
                         case "BattBootMsg": battBootMsg = v != 0; break;
                         case "Theme": theme = ThemeFromSetting(raw); break;
+                        case "ArtyPos":
+                        case "ArtyTarget":
+                        {
+                            int fi = k == "ArtyPos" ? 0 : 1;
+                            double x, y;
+                            if (Arty.Parse(raw, out x, out y)) { arX[fi] = x; arY[fi] = y; arText[fi] = ArShow(fi); }
+                            break;
+                        }
+                        case "ArtyTargets":   // "Nr x y;Nr x y"
+                            arTargets.Clear();
+                            foreach (string s in raw.Split(';'))
+                            {
+                                string[] f = s.Trim().Split(' ');
+                                int no;
+                                double x, y;
+                                if (f.Length == 3 && int.TryParse(f[0], out no)
+                                    && double.TryParse(f[1], NumberStyles.Float, CultureInfo.InvariantCulture, out x)
+                                    && double.TryParse(f[2], NumberStyles.Float, CultureInfo.InvariantCulture, out y)
+                                    && arTargets.Count < AR_MAX)
+                                    arTargets.Add(new ArTarget(no, x, y));
+                            }
+                            break;
+                        case "ArtyTable":     // "m mil;m mil"
+                            arTable.Clear();
+                            foreach (string s in raw.Split(';'))
+                            {
+                                string[] f = s.Trim().Split(' ');
+                                int d, m;
+                                if (f.Length == 2 && int.TryParse(f[0], out d) && int.TryParse(f[1], out m) && d > 0
+                                    && !arTable.Exists(delegate(int[] e) { return e[0] == d; }))
+                                    arTable.Add(new int[] { d, m });
+                            }
+                            arTable.Sort(delegate(int[] p, int[] q) { return p[0].CompareTo(q[0]); });
+                            break;
                         case "Programs":
                             programs.Clear();
                             foreach (string s in raw.Split(';'))
@@ -3720,6 +4377,11 @@ namespace PurpleClicker
         {
             try
             {
+                // Zahlen des Artillerie-Rechners immer mit Punkt, unabhaengig von der Windows-Sprache
+                List<string> targets = new List<string>();
+                foreach (ArTarget t in arTargets) targets.Add(t.No + " " + Arty.Num4(t.X) + " " + Arty.Num4(t.Y));
+                List<string> table = new List<string>();
+                foreach (int[] e in arTable) table.Add(e[0] + " " + e[1]);
                 File.WriteAllLines(settingsPath, new string[] {
                     "Interval=" + intervalMs,
                     "Right=" + (clicker.Right ? 1 : 0),
@@ -3740,7 +4402,11 @@ namespace PurpleClicker
                     "BattToastMsg=" + (battToastMsg ? 1 : 0),
                     "BattBootMsg=" + (battBootMsg ? 1 : 0),
                     "Theme=" + ThemeNames[theme],
-                    "Programs=" + string.Join(";", programs.ToArray())
+                    "Programs=" + string.Join(";", programs.ToArray()),
+                    "ArtyPos=" + (double.IsNaN(arX[0]) ? "" : Arty.Num4(arX[0]) + " " + Arty.Num4(arY[0])),
+                    "ArtyTarget=" + (double.IsNaN(arX[1]) ? "" : Arty.Num4(arX[1]) + " " + Arty.Num4(arY[1])),
+                    "ArtyTargets=" + string.Join(";", targets.ToArray()),
+                    "ArtyTable=" + string.Join(";", table.ToArray())
                 });
             }
             catch { }
@@ -3784,6 +4450,20 @@ namespace PurpleClicker
                 bd[0].Polled = bd[0].Online = bd[0].Known = true; bd[0].Last.Percent = 44;
                 bd[1].Polled = bd[1].Online = bd[1].Known = true; bd[1].Last.Percent = 83; bd[1].Last.Charging = true;
                 bd[2].Polled = bd[2].Known = true; bd[2].Last.Percent = 20; bd[2].LastSeen = Environment.TickCount - 7 * 60000;
+                // Artillerie-Seite: erfundene Tafel und Ziele (--rec 1 zeigt die Schusstafel)
+                arX[0] = 77.11; arY[0] = 75.32; arText[0] = ArShow(0);
+                arX[1] = 79.40; arY[1] = 71.20; arText[1] = ArShow(1);
+                arTargets.Clear();
+                arTargets.Add(new ArTarget(1, 80.91, 68.58));
+                arTargets.Add(new ArTarget(2, 79.40, 71.20));
+                arTargets.Add(new ArTarget(3, 75.02, 79.88));
+                arTable.Clear();
+                arTable.Add(new int[] { 150, 1400 });
+                arTable.Add(new int[] { 300, 1250 });
+                arTable.Add(new int[] { 450, 1080 });
+                arTable.Add(new int[] { 600, 850 });
+                if (page == 3 && snapRec == 1) { arTabOpen = true; arFocus = 2; arText[2] = "471 "; }
+                if (page == 3 && snapRec == 2) { arFocus = 1; arText[1] = "x79.4, y71"; }
             }
             using (Bitmap bmp = new Bitmap(ClientSize.Width, ClientSize.Height))
             {
