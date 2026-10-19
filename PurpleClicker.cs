@@ -77,6 +77,29 @@ namespace PurpleClicker
         public static extern IntPtr GetModuleHandle(string name);
         [DllImport("user32.dll", SetLastError = true)]
         public static extern uint SendInput(uint n, INPUT[] inputs, int size);
+
+        // Tastatur-Eingabe; Polster bringen die Struktur auf die Groesse von INPUT (Union mit MOUSEINPUT)
+        [StructLayout(LayoutKind.Sequential)]
+        public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct INPUTK { public uint type; public KEYBDINPUT ki; public uint pad1; public uint pad2; }
+        [DllImport("user32.dll", EntryPoint = "SendInput", SetLastError = true)]
+        public static extern uint SendInputK(uint n, INPUTK[] inputs, int size);
+
+        // Unbelegte Taste 0xE8 druecken und loslassen: ein Hotkey mit Alt/Win wird geschluckt, ohne diesen
+        // Zwischen-Tastendruck saehe Windows Alt bzw. Win allein und oeffnete beim Loslassen Menue bzw. Startmenue.
+        // Eigener Thread: SendInput im Hook-Thread laeuft wieder durch den eigenen Hook (siehe Remapper)
+        public static void MaskKey()
+        {
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                INPUTK[] a = new INPUTK[2];
+                a[0].type = a[1].type = 1;   // INPUT_KEYBOARD
+                a[0].ki.wVk = a[1].ki.wVk = 0xE8;
+                a[1].ki.dwFlags = 2;         // KEYEVENTF_KEYUP
+                SendInputK(2, a, Marshal.SizeOf(typeof(INPUTK)));
+            });
+        }
         [DllImport("user32.dll")]
         public static extern bool ReleaseCapture();
         [DllImport("user32.dll")]
@@ -170,10 +193,74 @@ namespace PurpleClicker
     {
         public bool IsMouse;
         public int Code; // Maus: 1..5 (Links, Rechts, Mitte, X1, X2) - Tastatur: Virtual-Key-Code
+        public int Mods; // Modifikatoren, die dazu gehalten werden muessen (MCtrl | MShift | MAlt | MWin)
 
-        public Hotkey(bool isMouse, int code) { IsMouse = isMouse; Code = code; }
+        public const int MCtrl = 1, MShift = 2, MAlt = 4, MWin = 8;
 
-        public string Name()
+        public Hotkey(bool isMouse, int code, int mods = 0) { IsMouse = isMouse; Code = code; Mods = mods & 15; }
+
+        // Gleiche Belegung (fuer Doppelbelegungs-Pruefung); Code 0 = keiner
+        public bool Same(Hotkey o) { return Code != 0 && o.Code == Code && o.IsMouse == IsMouse && o.Mods == Mods; }
+
+        // Ohne Modifikatoren feuert der Hotkey wie bisher auch mit gehaltenem Shift o. Ae. (Sprinten im Spiel);
+        // mit Modifikatoren muessen mindestens diese gehalten sein
+        public bool Matches(bool isMouse, int code, int held)
+        {
+            return Code != 0 && IsMouse == isMouse && Code == code && (Mods & held) == Mods;
+        }
+
+        // Anzahl Modifikatoren: passen mehrere Hotkeys, gewinnt der genauere (Shift+F6 vor F6)
+        public int Specificity()
+        {
+            int n = 0;
+            for (int m = Mods; m != 0; m >>= 1) n += m & 1;
+            return n;
+        }
+
+        public static bool IsModifierKey(int vk)
+        {
+            return (vk >= 0x10 && vk <= 0x12) || (vk >= 0xA0 && vk <= 0xA5) || vk == 0x5B || vk == 0x5C;
+        }
+
+        public static int ModOf(int vk)
+        {
+            if (vk == 0x11 || vk == 0xA2 || vk == 0xA3) return MCtrl;
+            if (vk == 0x10 || vk == 0xA0 || vk == 0xA1) return MShift;
+            if (vk == 0x12 || vk == 0xA4 || vk == 0xA5) return MAlt;
+            if (vk == 0x5B || vk == 0x5C) return MWin;
+            return 0;
+        }
+
+        // Gerade physisch gehaltene Modifikatoren. Im Hook ist das zuverlaessig: frueher gedrueckte Tasten sind
+        // schon im Tastenzustand, nur das aktuelle Ereignis noch nicht
+        public static int Held()
+        {
+            int m = 0;
+            if ((Native.GetAsyncKeyState(0x11) & 0x8000) != 0) m |= MCtrl;
+            if ((Native.GetAsyncKeyState(0x10) & 0x8000) != 0) m |= MShift;
+            if ((Native.GetAsyncKeyState(0x12) & 0x8000) != 0) m |= MAlt;
+            if ((Native.GetAsyncKeyState(0x5B) & 0x8000) != 0 || (Native.GetAsyncKeyState(0x5C) & 0x8000) != 0) m |= MWin;
+            return m;
+        }
+
+        string Prefix() { return ModText(Mods); }
+
+        public static string ModText(int mods)
+        {
+            return ((mods & MCtrl) != 0 ? "Strg+" : "") + ((mods & MShift) != 0 ? "Shift+" : "")
+                 + ((mods & MAlt) != 0 ? "Alt+" : "") + ((mods & MWin) != 0 ? "Win+" : "");
+        }
+
+        // Text im Feld waehrend des Belegens: schon gehaltene Modifikatoren, dann die Aufforderung
+        public static string CaptureText(string prompt)
+        {
+            string m = ModText(Held());
+            return m.Length > 0 ? m + "…" : prompt;
+        }
+
+        public string Name() { return Prefix() + BaseName(); }
+
+        string BaseName()
         {
             if (IsMouse)
             {
@@ -191,7 +278,8 @@ namespace PurpleClicker
 
         public string Short()
         {
-            return IsMouse ? "Maus " + Code : KeyName();
+            // mit Modifikatoren "M5" statt "Maus 5", damit es in die schmalen Felder passt
+            return Prefix() + (IsMouse ? (Mods != 0 ? "M" : "Maus ") + Code : KeyName());
         }
 
         string KeyName()
@@ -1919,8 +2007,8 @@ namespace PurpleClicker
         ArtyBtn, ArPos, ArTgt, ArAdd, ArRow, ArRowX, ArTable, ArTabField, ArTabAdd, ArTabX,
         KeysBtn, KsSw, KsCorner, KsMove, KsScale, KsOpacity, KsMargin, KsKey, KsCap, KsSnap, KsReset, KsPreview,
         KsHot, KsGlobal, KsProg, KsProgX, KsProgAdd,
-        SettingsBtn, StBarSw, StProcX, StProcAdd,
-        LinkDoc, LinkRepo
+        SettingsBtn, StBarSw, StProcX, StProcAdd, StStart, ClickBtn,
+        LinkDoc, LinkRepo, LinkHome
     }
 
     // ------------------------------------------------------------------ Fenster
@@ -1932,13 +2020,16 @@ namespace PurpleClicker
         // Titelleiste rechts: [Funktionen ...] [Farbrad] [Einstellungen] [Min] [X]; Funktionen rechtsbuendig,
         // ausgeblendete hinterlassen keine Luecke (LayoutTitle setzt die Rechtecke, leer = nicht sichtbar)
         static readonly Rectangle R_SettingsBtn = new Rectangle(574, 13, 30, 30);
-        Rectangle R_Gear, R_KeysBtn, R_ArtyBtn, R_BattBtn, R_MouseBtn;
-        // Symbole in der Leiste (Reihenfolge links -> rechts), zugehoerige Seite (-1 = Theme-Auswahl, keine Seite)
-        const int BarCount = 5, BAR_THEME = 4;
-        static readonly string[] BarNames = { "Tastenanzeige", "Artillerie-Rechner (Wardogs)", "Akku", "Maus-Umbelegung", "Theme-Auswahl" };
-        static readonly int[] BarPage = { 4, 3, 2, 1, -1 };
-        static readonly string[] BarKeys = { "BarKeys", "BarArty", "BarBatt", "BarMouse", "BarTheme" };   // INI-Schluessel
-        readonly bool[] barShow = { true, true, true, true, true };
+        Rectangle R_Gear, R_ClickBtn, R_KeysBtn, R_ArtyBtn, R_BattBtn, R_MouseBtn;
+        // Symbole in der Leiste je Funktion f, zugehoerige Seite (-1 = Theme-Auswahl, keine Seite).
+        // f bleibt fest (INI, Treffer); die Reihenfolge links -> rechts steht in BarOrder
+        const int BarCount = 6, BAR_THEME = 4, BAR_CLICK = 5;
+        static readonly string[] BarNames = { "Tastenanzeige", "Wardogs-Rechner", "Akku", "Maus-Umbelegung", "Theme-Auswahl", "Autoclicker" };
+        static readonly int[] BarPage = { 4, 3, 2, 1, -1, 0 };
+        static readonly string[] BarKeys = { "BarKeys", "BarArty", "BarBatt", "BarMouse", "BarTheme", "BarClick" };   // INI-Schluessel
+        static readonly int[] BarOrder = { BAR_CLICK, 0, 1, 2, 3, BAR_THEME };
+        readonly bool[] barShow = { true, true, true, true, true, true };
+        int startPage;                    // Seite beim Programmstart und hinter dem Logo (0 = Autoclicker)
         readonly List<string>[] barProcs = new List<string>[BarCount];   // nur wenn eines laeuft (im Konstruktor angelegt)
         readonly bool[] barRunning = new bool[BarCount];   // eines der Programme laeuft gerade
         readonly System.Windows.Forms.Timer procTimer = new System.Windows.Forms.Timer();
@@ -1948,6 +2039,7 @@ namespace PurpleClicker
         Rectangle linkDocRect = Rectangle.Empty, linkRepoRect = Rectangle.Empty;
         const string DocUrl = "https://docu.netpurple.net/docs/PurpleClicker/purple-clicker";
         const string RepoUrl = "https://github.com/codermongo/purpleclicker";
+        static readonly Rectangle R_Logo = new Rectangle(19, 13, 30, 30);   // Logo oben links: zur eingestellten Startseite
         static readonly Rectangle R_Min = new Rectangle(612, 13, 30, 30);
         static readonly Rectangle R_Close = new Rectangle(650, 13, 30, 30);
 
@@ -1972,7 +2064,8 @@ namespace PurpleClicker
         // Einstellungsseite: Autostart, darunter je Funktion Schalter fuer die Leiste und "nur wenn laeuft"
         static readonly Rectangle R_StCard = new Rectangle(20, 64, 660, 428);
         static readonly Rectangle R_StAutoSw = new Rectangle(620, 96, 44, 24);
-        const int ST_ROW_Y0 = 170, ST_ROW = 64, ST_CHIP_DY = 32, ST_CHIP_X0 = 186, ST_CHIP_X1 = 664, ST_CHIP_H = 24;
+        // Tabelle "Leiste oben": je Zeile Symbol, Name, "nur wenn laeuft"-Chips, Schalter
+        const int ST_ROW_Y0 = 206, ST_ROW = 46, ST_CHIP_X0 = 262, ST_CHIP_X1 = 604, ST_CHIP_H = 24;
         readonly List<Rectangle>[] stChipRects = new List<Rectangle>[BarCount];
         readonly Rectangle[] stAddRects = new Rectangle[BarCount];
         const int MAX_BAR_PROCS = 4;
@@ -2037,9 +2130,9 @@ namespace PurpleClicker
         static readonly string[] ShortNames = { "Linke Taste", "Rechte Taste", "Mausrad-Klick", "Maus 4 (hinten)", "Maus 5 (vorne)", "Rad hoch", "Rad runter", "Rad kippen links", "Rad kippen rechts" };
 
         static readonly Rectangle R_CardMul = new Rectangle(20, 262, 420, 56);
-        static readonly Rectangle R_MulSlider = new Rectangle(140, 268, 116, 44);
-        const int MUL_X = 150, MUL_W = 96, MUL_Y = 290;
-        static readonly Rectangle R_MulKey = new Rectangle(298, 273, 66, 30);
+        static readonly Rectangle R_MulSlider = new Rectangle(140, 268, 92, 44);
+        const int MUL_X = 150, MUL_W = 72, MUL_Y = 290;
+        static readonly Rectangle R_MulKey = new Rectangle(270, 273, 94, 30);   // breit genug fuer Modifikatoren (Strg+Alt+Maus 5)
         static readonly Rectangle R_CardDur = new Rectangle(456, 262, 224, 56);
         static readonly Rectangle R_DurSlider = new Rectangle(538, 268, 104, 44);
         const int DUR_X = 548, DUR_W = 84;
@@ -2290,7 +2383,8 @@ namespace PurpleClicker
         string rmNote = "";
         Hotkey mulKey = new Hotkey(false, 0);   // Hotkey fuer den Multiplikator (Code 0 = keiner)
         bool capturing;
-        int capTarget;                          // 0 = Start/Stop-Hotkey, 1 = Multiplikator-Hotkey
+        int capTarget;                          // 0 = Start/Stop-Hotkey, 1 = Multiplikator-Hotkey, 2 = Tastenanzeige
+        int capModVk;                           // beim Belegen zuletzt gedrueckter Modifikator (allein losgelassen = Hotkey)
         readonly bool[] swallowUp = new bool[6];
         readonly HashSet<int> swallowedKeys = new HashSet<int>();
 
@@ -2440,6 +2534,7 @@ namespace PurpleClicker
                     clicker.Burst(multiplier - 1);
             };
             LoadSettings();
+            page = HomePage();   // eingestellte Startseite (sofern ihr Symbol sichtbar ist)
             if (snapView >= 0) mouseView = snapView;
             mousePhoto = LoadPhoto("mouse-photo.png");
             MouseDetect.Refresh();
@@ -2597,13 +2692,34 @@ namespace PurpleClicker
         {
             Rectangle[] r = new Rectangle[BarCount];
             int x = R_SettingsBtn.X - 38;   // 8 px Abstand wie zwischen den uebrigen Knoepfen
-            for (int f = BarCount - 1; f >= 0; f--)
+            for (int i = BarOrder.Length - 1; i >= 0; i--)
             {
+                int f = BarOrder[i];
                 if (!BarVisible(f)) continue;
                 r[f] = new Rectangle(x, 13, 30, 30);
                 x -= 38;
             }
-            R_KeysBtn = r[0]; R_ArtyBtn = r[1]; R_BattBtn = r[2]; R_MouseBtn = r[3]; R_Gear = r[BAR_THEME];
+            R_KeysBtn = r[0]; R_ArtyBtn = r[1]; R_BattBtn = r[2]; R_MouseBtn = r[3]; R_Gear = r[BAR_THEME]; R_ClickBtn = r[BAR_CLICK];
+        }
+
+        // Startseite (Programmstart, Logo, Zurueck); ist sie gerade ausgeblendet: erste sichtbare Seite, sonst Einstellungen
+        int HomePage()
+        {
+            for (int f = 0; f < BarCount; f++)
+                if (BarPage[f] == startPage && BarVisible(f)) return startPage;
+            foreach (int f in BarOrder)
+                if (BarPage[f] >= 0 && BarVisible(f)) return BarPage[f];
+            return 5;
+        }
+
+        void GoHome()
+        {
+            EndRecording(false);
+            EndKeysPlacing();
+            page = HomePage();
+            popupOpen = false;
+            themeOpen = false;
+            arTabOpen = false;
         }
 
         // Laufende Programme fuer "nur wenn laeuft" pruefen. Die Prozessliste kostet einige ms und laeuft deshalb
@@ -2648,7 +2764,7 @@ namespace PurpleClicker
             for (int f = 0; f < BarCount; f++)
                 if (running[f] != barRunning[f]) { barRunning[f] = running[f]; changed = true; }
             for (int f = 0; f < BarCount; f++)
-                if (page == BarPage[f] && !BarVisible(f)) { EndRecording(false); EndKeysPlacing(); page = 0; popupOpen = false; changed = true; }
+                if (page == BarPage[f] && !BarVisible(f)) { EndRecording(false); EndKeysPlacing(); page = HomePage(); popupOpen = false; changed = true; }
             if (themeOpen && !BarVisible(BAR_THEME)) { themeOpen = false; changed = true; }
             if (changed && Visible) Invalidate();
         }
@@ -3136,56 +3252,71 @@ namespace PurpleClicker
 
             if (capturing)
             {
-                AssignKey(true, btn);
+                AssignKey(true, btn, Hotkey.Held());
                 capturing = false;
                 swallowUp[btn] = true;
                 Invalidate();
                 return true;
             }
-            if (keysKey.Code != 0 && keysKey.IsMouse && keysKey.Code == btn)
+            int held = Hotkey.Held();
+            int which = BestHotkey(true, btn, held);
+            if (which >= 0)
             {
                 swallowUp[btn] = true;
-                ToggleKeysByHotkey();
+                FireHotkey(which, held);
                 return true;
             }
             if (!active) return false;
-            if (hotkey.IsMouse && hotkey.Code == btn)
-            {
-                swallowUp[btn] = true;
-                Toggle();
-                return true;
-            }
-            if (mulKey.Code != 0 && mulKey.IsMouse && mulKey.Code == btn)
-            {
-                swallowUp[btn] = true;
-                ToggleMulti();
-                return true;
-            }
             return remap.On && remap.Button(btn, true, RemapAllowed(pt));
         }
 
-        // Belegt den gerade gewaehlten Hotkey (Start/Stop oder Multiplikator); keine Doppelbelegung
-        void AssignKey(bool isMouse, int code)
+        // Welcher Hotkey passt: 0 Start/Stop, 1 Multiplikator, 2 Tastenanzeige, -1 keiner.
+        // Start/Stop und Multiplikator nur, wenn der Programm-Filter passt; bei mehreren gewinnt der genauere
+        int BestHotkey(bool isMouse, int code, int held)
         {
+            Hotkey[] keys = { hotkey, mulKey, keysKey };
+            int best = -1;
+            for (int i = 0; i < keys.Length; i++)
+            {
+                if (i < 2 && !active) continue;
+                if (!keys[i].Matches(isMouse, code, held)) continue;
+                if (best < 0 || keys[i].Specificity() > keys[best].Specificity()) best = i;
+            }
+            return best;
+        }
+
+        void FireHotkey(int which, int held)
+        {
+            if ((held & (Hotkey.MAlt | Hotkey.MWin)) != 0) Native.MaskKey();
+            if (which == 0) Toggle();
+            else if (which == 1) ToggleMulti();
+            else ToggleKeysByHotkey();
+        }
+
+        // Belegt den gerade gewaehlten Hotkey (Start/Stop, Multiplikator oder Tastenanzeige); keine Doppelbelegung
+        void AssignKey(bool isMouse, int code, int mods)
+        {
+            Hotkey h = new Hotkey(isMouse, code, mods);
+            Hotkey none = new Hotkey(false, 0);
             if (capTarget == 0)
             {
-                hotkey = new Hotkey(isMouse, code);
-                if (mulKey.IsMouse == isMouse && mulKey.Code == code) mulKey = new Hotkey(false, 0);
-                if (keysKey.IsMouse == isMouse && keysKey.Code == code) keysKey = new Hotkey(false, 0);
+                hotkey = h;
+                if (mulKey.Same(h)) mulKey = none;
+                if (keysKey.Same(h)) keysKey = new Hotkey(false, 0);
             }
             else if (capTarget == 1)
             {
-                if (hotkey.IsMouse == isMouse && hotkey.Code == code) return;
-                mulKey = new Hotkey(isMouse, code);
-                if (keysKey.IsMouse == isMouse && keysKey.Code == code) keysKey = new Hotkey(false, 0);
+                if (hotkey.Same(h)) return;
+                mulKey = h;
+                if (keysKey.Same(h)) keysKey = none;
             }
             else
             {
                 // Tastenanzeige: weder Start/Stop- noch Multiplikator-Hotkey ueberschreiben
-                if ((hotkey.IsMouse == isMouse && hotkey.Code == code) || (mulKey.IsMouse == isMouse && mulKey.Code == code)) return;
-                keysKey = new Hotkey(isMouse, code);
-                SaveSettings();
+                if (hotkey.Same(h) || mulKey.Same(h)) return;
+                keysKey = h;
             }
+            SaveSettings();
         }
 
         void ToggleMulti()
@@ -3223,7 +3354,19 @@ namespace PurpleClicker
         {
             if (keysOn) keyMon.Key(vk, down);
             if (!down)
+            {
+                // Beim Belegen nur einen Modifikator gedrueckt und losgelassen: er selbst wird der Hotkey (z. B. "Shift links")
+                if (capturing && vk == capModVk)
+                {
+                    capturing = false;
+                    capModVk = 0;
+                    AssignKey(false, vk, Hotkey.Held() & ~Hotkey.ModOf(vk));
+                    Invalidate();
+                    return false;   // Druecken lief auch durch
+                }
+                if (capturing && Hotkey.IsModifierKey(vk)) BeginInvoke((MethodInvoker)Invalidate);   // Anzeige "Strg+…" nachfuehren
                 return swallowedKeys.Remove(vk);
+            }
             // Enter/Esc beenden das Verschieben, auch wenn gerade das Spiel im Vordergrund ist
             if (KeysPlacing && (vk == (int)Keys.Return || vk == (int)Keys.Escape))
             {
@@ -3244,32 +3387,26 @@ namespace PurpleClicker
             }
             if (capturing)
             {
+                // Modifikatoren nur merken und durchlassen (geschluckt fehlten sie im Tastenzustand), dann zaehlt
+                // die naechste Taste samt der gehaltenen Modifikatoren
+                if (Hotkey.IsModifierKey(vk)) { capModVk = vk; BeginInvoke((MethodInvoker)Invalidate); return false; }
                 capturing = false;
+                capModVk = 0;
                 swallowedKeys.Add(vk);
-                if (vk != (int)Keys.Escape) AssignKey(false, vk);
+                if (vk != (int)Keys.Escape) AssignKey(false, vk, Hotkey.Held());
                 else if (capTarget == 1) mulKey = new Hotkey(false, 0);   // Esc entfernt den Multiplikator-Hotkey
                 else if (capTarget == 2) { keysKey = new Hotkey(false, 0); SaveSettings(); }   // bzw. den der Tastenanzeige
                 Invalidate();
                 return true;
             }
-            // Tastenanzeige an/aus: unabhaengig vom Programm-Filter des Autoclickers
-            if (keysKey.Code != 0 && !keysKey.IsMouse && keysKey.Code == vk)
-            {
-                if (swallowedKeys.Add(vk)) ToggleKeysByHotkey();   // Auto-Repeat nur schlucken
-                return true;
-            }
-            if (!active) return false;
-            if (!hotkey.IsMouse && hotkey.Code == vk)
-            {
-                if (swallowedKeys.Add(vk)) Toggle(); // Auto-Repeat nur schlucken
-                return true;
-            }
-            if (mulKey.Code != 0 && !mulKey.IsMouse && mulKey.Code == vk)
-            {
-                if (swallowedKeys.Add(vk)) ToggleMulti();
-                return true;
-            }
-            return false;
+            // Auto-Repeat eines geschluckten Hotkeys: weiter schlucken, nicht erneut ausloesen
+            if (swallowedKeys.Contains(vk)) return true;
+            int held = Hotkey.Held();
+            int which = BestHotkey(false, vk, held);
+            if (which < 0) return false;
+            swallowedKeys.Add(vk);
+            FireHotkey(which, held);
+            return true;
         }
 
         // ---------------------------------------------------------- Vordergrund-Erkennung
@@ -3769,7 +3906,7 @@ namespace PurpleClicker
             if (k == Keys.Tab && !arTabOpen) { ArFocus(0); return true; }
             if (k == Keys.Escape)
             {
-                if (arTabOpen) arTabOpen = false; else page = 0;
+                if (arTabOpen) arTabOpen = false; else page = HomePage();
                 arErr = "";
                 return true;
             }
@@ -3856,10 +3993,12 @@ namespace PurpleClicker
             }
             LayoutTitle();
             if (R_SettingsBtn.Contains(p)) return Hit.SettingsBtn;
+            if (R_ClickBtn.Contains(p)) return Hit.ClickBtn;
             if (R_MouseBtn.Contains(p)) return Hit.MouseBtn;
             if (R_BattBtn.Contains(p)) return Hit.BattBtn;
             if (R_ArtyBtn.Contains(p)) return Hit.ArtyBtn;
             if (R_KeysBtn.Contains(p)) return Hit.KeysBtn;
+            if (logo != null && R_Logo.Contains(p)) return Hit.LinkHome;
             if (linkDocRect.Contains(p)) return Hit.LinkDoc;
             if (linkRepoRect.Contains(p)) return Hit.LinkRepo;
             if (R_Title.Contains(p)) return Hit.Drag;
@@ -3906,7 +4045,13 @@ namespace PurpleClicker
             return Hit.None;
         }
 
-        static Rectangle StBarSwRect(int f) { return new Rectangle(620, ST_ROW_Y0 + f * ST_ROW + 3, 44, 24); }
+        // Zeile row der Tabelle "Leiste oben" (Reihenfolge wie in der Leiste)
+        static Rectangle StBarSwRect(int row) { return new Rectangle(620, ST_ROW_Y0 + row * ST_ROW + (ST_ROW - 24) / 2, 44, 24); }
+
+        // Knopf der Startseiten-Auswahl fuer Seite BarPage[BarOrder[i]] (ohne Theme-Auswahl)
+        static Rectangle StStartRect(int i) { return new Rectangle(664 - 30 - (StStartPages.Length - 1 - i) * 38, 133, 30, 30); }
+        static readonly int[] StStartFeat = { BAR_CLICK, 0, 1, 2, 3 };
+        static readonly int[] StStartPages = { 0, 4, 3, 2, 1 };
 
         Hit HitSettings(Point p)
         {
@@ -3914,9 +4059,12 @@ namespace PurpleClicker
             Rectangle auto = R_StAutoSw;
             auto.Inflate(8, 4);
             if (auto.Contains(p)) return Hit.AutoSw;
-            for (int f = 0; f < BarCount; f++)
+            for (int i = 0; i < StStartPages.Length; i++)
+                if (StStartRect(i).Contains(p)) { hitIndex = StStartPages[i]; return Hit.StStart; }
+            for (int row = 0; row < BarOrder.Length; row++)
             {
-                Rectangle sw = StBarSwRect(f);
+                int f = BarOrder[row];
+                Rectangle sw = StBarSwRect(row);
                 sw.Inflate(8, 4);
                 if (sw.Contains(p)) { hitIndex = f; return Hit.StBarSw; }
                 for (int i = 0; i < stChipRects[f].Count; i++)
@@ -4152,36 +4300,46 @@ namespace PurpleClicker
                 case Hit.ThemeOutside: themeOpen = false; break;
                 case Hit.LinkDoc: OpenUrl(DocUrl); break;
                 case Hit.LinkRepo: OpenUrl(RepoUrl); break;
+                case Hit.LinkHome: GoHome(); break;
+                case Hit.ClickBtn:
+                    EndRecording(false);
+                    page = 0;
+                    popupOpen = false;
+                    themeOpen = false;
+                    break;
+                case Hit.StStart:
+                    if (idx >= 0 && idx <= 4) { startPage = idx; SaveSettings(); }
+                    break;
                 case Hit.MouseBtn:
                     EndRecording(false);
-                    page = page == 1 ? 0 : 1;
+                    page = page == 1 ? HomePage() : 1;
                     if (page == 1) MouseDetect.Refresh(); // Maus evtl. inzwischen gewechselt
                     popupOpen = false;
                     themeOpen = false;
                     break;
                 case Hit.BattBtn:
                     EndRecording(false);
-                    page = page == 2 ? 0 : 2;
+                    page = page == 2 ? HomePage() : 2;
                     if (page == 2 && servicesStarted) Battery.Poke(0);   // frische Werte holen
                     popupOpen = false;
                     themeOpen = false;
                     break;
                 case Hit.ArtyBtn:
                     EndRecording(false);
-                    page = page == 3 ? 0 : 3;
+                    page = page == 3 ? HomePage() : 3;
                     popupOpen = false;
                     themeOpen = false;
                     arTabOpen = false;
                     break;
                 case Hit.KeysBtn:
                     EndRecording(false);
-                    page = page == 4 ? 0 : 4;
+                    page = page == 4 ? HomePage() : 4;
                     popupOpen = false;
                     themeOpen = false;
                     break;
                 case Hit.SettingsBtn:
                     EndRecording(false);
-                    page = page == 5 ? 0 : 5;
+                    page = page == 5 ? HomePage() : 5;
                     popupOpen = false;
                     themeOpen = false;
                     break;
@@ -4529,7 +4687,7 @@ namespace PurpleClicker
             }
             if ((page == 1 || page == 2 || ((page == 4 || page == 5) && !popupOpen)) && !themeOpen && e.KeyCode == Keys.Escape)
             {
-                page = 0;
+                page = HomePage();
                 Invalidate();
                 e.Handled = true;
                 return;
@@ -4877,6 +5035,7 @@ namespace PurpleClicker
             int titleX = 24;
             if (logo != null)
             {
+                if (hover == Hit.LinkHome) BtnShape(g, C_BtnHover, R_Logo);
                 g.InterpolationMode = InterpolationMode.HighQualityBicubic;
                 g.DrawImage(logo, new Rectangle(22, 16, 24, 24));
                 titleX = 54;
@@ -4903,6 +5062,7 @@ namespace PurpleClicker
             LayoutTitle();
             DrawFeatIcon(g, BAR_THEME, R_Gear, hover == Hit.Gear, themeOpen);
             DrawSettingsIcon(g, hover == Hit.SettingsBtn);
+            DrawFeatIcon(g, BAR_CLICK, R_ClickBtn, hover == Hit.ClickBtn, page == 0);
             DrawFeatIcon(g, 0, R_KeysBtn, hover == Hit.KeysBtn, page == 4);
             DrawFeatIcon(g, 1, R_ArtyBtn, hover == Hit.ArtyBtn, page == 3);
             DrawFeatIcon(g, 2, R_BattBtn, hover == Hit.BattBtn, page == 2);
@@ -4961,7 +5121,7 @@ namespace PurpleClicker
             bool capMul = capturing && capTarget == 1;
             StrokeRR(g, capMain ? C_Accent : C_CardLine, R_HotPill, RadCtl(R_HotPill.Height), capMain ? 1.5f : 1f);
             if (capMain)
-                DrawText(g, "Taste drücken…", fBtn, C_Accent,
+                DrawText(g, Hotkey.CaptureText("Taste drücken…"), fBtn, C_Accent,
                     new Rectangle(R_HotPill.X + 16, R_HotPill.Y, 118, R_HotPill.Height), StringAlignment.Near);
             else
                 DrawText(g, hotkey.Name(), fBtn, C_Text,
@@ -4984,11 +5144,11 @@ namespace PurpleClicker
                 using (SolidBrush b = new SolidBrush(Color.FromArgb(i < multiplier ? 90 : 50, 150, 150, 150)))
                     g.FillEllipse(b, tx2 - 1, MUL_Y + 12, 3, 3);
             }
-            DrawText(g, multiplier + "×", fBtn, multiOn ? C_Accent : C_Dim, new Rectangle(R_CardMul.X + 236, R_CardMul.Y, 38, R_CardMul.Height), StringAlignment.Center);
+            DrawText(g, multiplier + "×", fBtn, multiOn ? C_Accent : C_Dim, new Rectangle(R_CardMul.X + 212, R_CardMul.Y, 38, R_CardMul.Height), StringAlignment.Center);
             // Hotkey-Feld: Klick, dann Taste oder Maustaste druecken (Esc entfernt)
             FillRR(g, C_Field, R_MulKey, RadCtl(R_MulKey.Height));
             StrokeRR(g, capMul ? C_Accent : (hover == Hit.MulKey ? C_Dim : C_CardLine), R_MulKey, RadCtl(R_MulKey.Height), capMul ? 1.5f : 1f);
-            DrawText(g, capMul ? "Taste…" : (mulKey.Code == 0 ? "–" : mulKey.Short()), fChip,
+            DrawText(g, capMul ? Hotkey.CaptureText("Taste…") : (mulKey.Code == 0 ? "–" : mulKey.Short()), fChip,
                 capMul ? C_Accent : (mulKey.Code == 0 ? C_Dim : C_Text),
                 new Rectangle(R_MulKey.X + 3, R_MulKey.Y, R_MulKey.Width - 6, R_MulKey.Height), StringAlignment.Center);
             Switch(g, R_MulSw, multiOn, hover == Hit.MulSw);
@@ -5069,7 +5229,31 @@ namespace PurpleClicker
             else if (f == 1) DrawArtyIcon(g, r, hot, sel);
             else if (f == 2) DrawBattIcon(g, r, hot, sel);
             else if (f == 3) DrawMouseIcon(g, r, hot, sel);
+            else if (f == BAR_CLICK) DrawClickIcon(g, r, hot, sel);
             else DrawThemeIcon(g, r, hot || sel);
+        }
+
+        // Autoclicker: Mauszeiger mit Klick-Strahlen
+        void DrawClickIcon(Graphics g, Rectangle r, bool hot, bool sel)
+        {
+            BtnShape(g, hot || sel ? C_BtnHover : C_Btn, r);
+            float cx = r.X + r.Width / 2f, cy = r.Y + r.Height / 2f;
+            Color c = sel ? C_Accent : C_Text;
+            float ox = cx - 3f, oy = cy - 5f;   // Spitze des Zeigers
+            PointF[] arrow = {
+                new PointF(ox, oy), new PointF(ox, oy + 13f), new PointF(ox + 3.2f, oy + 10f), new PointF(ox + 5.6f, oy + 14.6f),
+                new PointF(ox + 7.6f, oy + 13.6f), new PointF(ox + 5.3f, oy + 9.2f), new PointF(ox + 9.6f, oy + 9.2f) };
+            using (Pen pen = new Pen(c, 1.5f))
+            {
+                pen.LineJoin = LineJoin.Round;
+                pen.StartCap = LineCap.Round;
+                pen.EndCap = LineCap.Round;
+                g.DrawPolygon(pen, arrow);
+                // Strahlen links oberhalb der Spitze
+                g.DrawLine(pen, ox - 2.5f, oy - 2.5f, ox - 5f, oy - 5f);
+                g.DrawLine(pen, ox, oy - 3.5f, ox, oy - 7f);
+                g.DrawLine(pen, ox - 3.5f, oy, ox - 7f, oy);
+            }
         }
 
         // Einstellungen (ganz rechts): Zahnrad mit acht Zaehnen
@@ -5177,21 +5361,26 @@ namespace PurpleClicker
             Card(g, R_StCard, "EINSTELLUNGEN");
             DrawText(g, "Mit Windows starten", fBtn, C_Text, new Rectangle(40, R_StAutoSw.Y, 500, R_StAutoSw.Height), StringAlignment.Near);
             Switch(g, R_StAutoSw, autostart, hover == Hit.AutoSw);
+            // Startseite: beim Programmstart und hinter dem Logo
+            DrawText(g, "Startseite", fBtn, C_Text, new Rectangle(40, 133, 300, 30), StringAlignment.Near);
+            for (int i = 0; i < StStartPages.Length; i++)
+                DrawFeatIcon(g, StStartFeat[i], StStartRect(i), hover == Hit.StStart && hoverIdx == StStartPages[i], startPage == StStartPages[i]);
             using (Pen sep = new Pen(C_CardLine, 1f))
-                g.DrawLine(sep, 36, 136, 664, 136);
-            DrawText(g, "LEISTE OBEN", fLabel, C_Dim, new Rectangle(36, 144, 300, 20), StringAlignment.Near);
+                g.DrawLine(sep, 36, 176, 664, 176);
+            DrawText(g, "LEISTE OBEN", fLabel, C_Dim, new Rectangle(36, 184, 200, 20), StringAlignment.Near);
+            DrawText(g, "NUR WENN LÄUFT", fLabel, C_Dim, new Rectangle(ST_CHIP_X0, 184, 200, 20), StringAlignment.Near);
 
-            for (int f = 0; f < BarCount; f++)
+            for (int row = 0; row < BarOrder.Length; row++)
             {
-                int y = ST_ROW_Y0 + f * ST_ROW;
+                int f = BarOrder[row];
+                int y = ST_ROW_Y0 + row * ST_ROW;
                 bool on = barShow[f];
-                DrawFeatIcon(g, f, new Rectangle(36, y, 30, 30), false, on && BarVisible(f));
-                DrawText(g, BarNames[f], fBtn, on ? C_Text : C_Dim, new Rectangle(78, y, 500, 30), StringAlignment.Near);
-                Switch(g, StBarSwRect(f), on, hover == Hit.StBarSw && hoverIdx == f);
+                DrawFeatIcon(g, f, new Rectangle(36, y + (ST_ROW - 30) / 2, 30, 30), false, on && BarVisible(f));
+                DrawText(g, BarNames[f], fBtn, on ? C_Text : C_Dim, new Rectangle(78, y, ST_CHIP_X0 - 86, ST_ROW), StringAlignment.Near);
+                Switch(g, StBarSwRect(row), on, hover == Hit.StBarSw && hoverIdx == f);
 
                 // Programme, von denen eines laufen muss (leer = immer)
-                int cy = y + ST_CHIP_DY;
-                DrawText(g, "Nur wenn läuft", fChip, C_Dim, new Rectangle(78, cy, ST_CHIP_X0 - 84, ST_CHIP_H), StringAlignment.Near);
+                int cy = y + (ST_ROW - ST_CHIP_H) / 2;
                 stChipRects[f].Clear();
                 stAddRects[f] = Rectangle.Empty;
                 int x = ST_CHIP_X0;
@@ -5200,7 +5389,7 @@ namespace PurpleClicker
                 {
                     string name = barProcs[f][i];
                     float tw = g.MeasureString(name, fChip, 2000, StringFormat.GenericTypographic).Width;
-                    int w = (int)Math.Min(tw + 56, 180);
+                    int w = (int)Math.Min(tw + 56, 150);
                     if (x + w > ST_CHIP_X1) break;
                     Rectangle r = new Rectangle(x, cy, w, ST_CHIP_H);
                     stChipRects[f].Add(r);
@@ -5227,9 +5416,9 @@ namespace PurpleClicker
                     StrokeRR(g, C_Accent, stAddRects[f], cr, 1f);
                     DrawText(g, "+", fBtn, C_Accent, stAddRects[f], StringAlignment.Center);
                 }
-                if (f < BarCount - 1)
+                if (row < BarOrder.Length - 1)
                     using (Pen sep = new Pen(A(120, C_CardLine), 1f))
-                        g.DrawLine(sep, 36, y + ST_ROW - 9, 664, y + ST_ROW - 9);
+                        g.DrawLine(sep, 36, y + ST_ROW, 664, y + ST_ROW);
             }
             if (popupOpen) DrawPopup(g);
         }
@@ -5249,7 +5438,7 @@ namespace PurpleClicker
             FillRR(g, C_Field, R_KsHot, hr);
             StrokeRR(g, capKs ? C_Accent : hover == Hit.KsHot ? C_Dim : C_CardLine, R_KsHot, hr, capKs ? 1.5f : 1f);
             if (capKs)
-                DrawText(g, "Taste drücken…", fChip, C_Accent, R_KsHot, StringAlignment.Center);
+                DrawText(g, Hotkey.CaptureText("Taste drücken…"), fChip, C_Accent, R_KsHot, StringAlignment.Center);
             else
             {
                 Rectangle inner = new Rectangle(R_KsHot.X + 12, R_KsHot.Y, R_KsHot.Width - 24, R_KsHot.Height);
@@ -6003,6 +6192,7 @@ namespace PurpleClicker
                         case "Double": clicker.Double = v != 0; break;
                         case "HotMouse": hotkey.IsMouse = v != 0; break;
                         case "HotCode": hotkey.Code = v; break;
+                        case "HotMods": hotkey.Mods = v & 15; break;
                         case "FilterOn": filterOn = v != 0; break;
                         case "MultiOn": multiOn = v != 0; break;
                         case "MouseView": mouseView = v >= 0 && v <= 3 ? v : 0; break;
@@ -6017,6 +6207,7 @@ namespace PurpleClicker
                         case "Remap": remap.Load(raw); break;
                         case "MulHotMouse": mulKey.IsMouse = v != 0; break;
                         case "MulHotCode": mulKey.Code = v; break;
+                        case "MulHotMods": mulKey.Mods = v & 15; break;
                         case "Multi": multiplier = Math.Min(Math.Max(v, 1), 10); break;
                         case "OverlaySec": overlaySec = Math.Min(Math.Max(v, 1), 10); break;
                         case "BattDropMsg": battDropMsg = v != 0; break;
@@ -6025,11 +6216,13 @@ namespace PurpleClicker
                         case "KeysOn": keysOn = v != 0; break;
                         case "KeysCorner": keysStd.Corner = v >= 0 && v <= 4 ? v : 1; break;
                         case "KeysGlobal": keysGlobal = v != 0; break;
+                        case "StartPage": startPage = v >= 0 && v <= 4 ? v : 0; break;
                         case "BarKeys":
                         case "BarArty":
                         case "BarBatt":
                         case "BarMouse":
-                        case "BarTheme":   // "1;prog.exe;prog2.exe": Symbol an/aus, dann "nur wenn laeuft"
+                        case "BarTheme":
+                        case "BarClick":   // "1;prog.exe;prog2.exe": Symbol an/aus, dann "nur wenn laeuft"
                         {
                             int bf = Array.IndexOf(BarKeys, k);
                             string[] f = raw.Split(';');
@@ -6044,6 +6237,7 @@ namespace PurpleClicker
                         }
                         case "KeysHotMouse": keysKey.IsMouse = v != 0; break;
                         case "KeysHotCode": keysKey.Code = v; break;
+                        case "KeysHotMods": keysKey.Mods = v & 15; break;
                         case "KeysPrograms":   // "exe ecke x y;exe ecke x y"
                             keysPrograms.Clear();
                             keysPlaces.Clear();
@@ -6117,12 +6311,10 @@ namespace PurpleClicker
                     }
                 }
                 if (hotkey.IsMouse && (hotkey.Code < 1 || hotkey.Code > 5)) hotkey = new Hotkey(false, (int)Keys.F6);
-                if ((mulKey.IsMouse && (mulKey.Code < 1 || mulKey.Code > 5)) || mulKey.Code < 0 ||
-                    (mulKey.IsMouse == hotkey.IsMouse && mulKey.Code == hotkey.Code))
+                if ((mulKey.IsMouse && (mulKey.Code < 1 || mulKey.Code > 5)) || mulKey.Code < 0 || mulKey.Same(hotkey))
                     mulKey = new Hotkey(false, 0);
                 if ((keysKey.IsMouse && (keysKey.Code < 1 || keysKey.Code > 5)) || keysKey.Code < 0 ||
-                    (keysKey.IsMouse == hotkey.IsMouse && keysKey.Code == hotkey.Code) ||
-                    (mulKey.Code != 0 && keysKey.IsMouse == mulKey.IsMouse && keysKey.Code == mulKey.Code))
+                    keysKey.Same(hotkey) || keysKey.Same(mulKey))
                     keysKey = new Hotkey(false, 0);
             }
             catch { }
@@ -6148,6 +6340,7 @@ namespace PurpleClicker
                     "Double=" + (clicker.Double ? 1 : 0),
                     "HotMouse=" + (hotkey.IsMouse ? 1 : 0),
                     "HotCode=" + hotkey.Code,
+                    "HotMods=" + hotkey.Mods,
                     "FilterOn=" + (filterOn ? 1 : 0),
                     "MultiOn=" + (multiOn ? 1 : 0),
                     "MouseView=" + mouseView,
@@ -6156,6 +6349,7 @@ namespace PurpleClicker
                     "Remap=" + remap.Serialize(),
                     "MulHotMouse=" + (mulKey.IsMouse ? 1 : 0),
                     "MulHotCode=" + mulKey.Code,
+                    "MulHotMods=" + mulKey.Mods,
                     "Multi=" + multiplier,
                     "OverlaySec=" + overlaySec,
                     "BattDropMsg=" + (battDropMsg ? 1 : 0),
@@ -6166,6 +6360,7 @@ namespace PurpleClicker
                     "KeysGlobal=" + (keysGlobal ? 1 : 0),
                     "KeysHotMouse=" + (keysKey.IsMouse ? 1 : 0),
                     "KeysHotCode=" + keysKey.Code,
+                    "KeysHotMods=" + keysKey.Mods,
                     "KeysPrograms=" + string.Join(";", keysPrograms.ConvertAll(delegate(string ex)
                         { KeysPlace kp = PlaceOf(ex); return ex + " " + kp.Corner + " " + kp.X + " " + kp.Y; }).ToArray()),
                     "KeysHide=" + KeyOverlayForm.HiddenIds(KeyOverlayForm.DefaultCaps, keysShow),
@@ -6182,6 +6377,8 @@ namespace PurpleClicker
                     BarKeys[2] + "=" + BarLine(2),
                     BarKeys[3] + "=" + BarLine(3),
                     BarKeys[4] + "=" + BarLine(4),
+                    BarKeys[5] + "=" + BarLine(5),
+                    "StartPage=" + startPage,
                     "Programs=" + string.Join(";", programs.ToArray()),
                     "ArtyPos=" + (double.IsNaN(arX[0]) ? "" : Arty.Num4(arX[0]) + " " + Arty.Num4(arY[0])),
                     "ArtyTarget=" + (double.IsNaN(arX[1]) ? "" : Arty.Num4(arX[1]) + " " + Arty.Num4(arY[1])),
