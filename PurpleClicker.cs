@@ -122,6 +122,29 @@ namespace PurpleClicker
         public static extern bool CloseHandle(IntPtr h);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
         public static extern bool QueryFullProcessImageName(IntPtr hProcess, uint flags, StringBuilder sb, ref int size);
+        [DllImport("user32.dll")]
+        public static extern short GetAsyncKeyState(int vk);
+
+        // Fenster mit Alpha je Pixel (Tastenanzeige)
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SIZE { public int cx; public int cy; }
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
+        public struct BLENDFUNCTION { public byte BlendOp; public byte BlendFlags; public byte SourceConstantAlpha; public byte AlphaFormat; }
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst, ref POINT pptDst, ref SIZE psize,
+            IntPtr hdcSrc, ref POINT pptSrc, int crKey, ref BLENDFUNCTION pblend, int flags);
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetDC(IntPtr hWnd);
+        [DllImport("user32.dll")]
+        public static extern int ReleaseDC(IntPtr hWnd, IntPtr hdc);
+        [DllImport("gdi32.dll")]
+        public static extern IntPtr CreateCompatibleDC(IntPtr hdc);
+        [DllImport("gdi32.dll")]
+        public static extern bool DeleteDC(IntPtr hdc);
+        [DllImport("gdi32.dll")]
+        public static extern IntPtr SelectObject(IntPtr hdc, IntPtr obj);
+        [DllImport("gdi32.dll")]
+        public static extern bool DeleteObject(IntPtr obj);
 
         // Dateiname (klein geschrieben) der exe, zu der ein Fenster gehoert
         public static string ExeOfWindow(IntPtr hwnd, out uint pid)
@@ -537,6 +560,650 @@ namespace PurpleClicker
                 int.TryParse(p[i].Trim(), out v);
                 Map[i] = v < 0 || v >= ActionNames.Length || IsSelf(i, v) ? 0 : v;
             }
+        }
+    }
+
+    // ------------------------------------------------------------------ Tastenanzeige
+    // Welche Tasten gerade gedrueckt sind. Reine Buchfuehrung ohne Win32: die Hooks speisen ein, der Zeichner fragt ab.
+    // Ein spaeterer Wechsel auf Raw Input tauscht nur die Einspeisung aus.
+    enum CapSrc { Key, Mouse, WheelUp, WheelDown, TiltLeft, TiltRight }
+
+    struct Cap
+    {
+        public string Id;      // Name fuer --keys (W, Shift, LMB ...)
+        public string Label;
+        public CapSrc Src;
+        public int Code;       // Virtual-Key oder Maustaste 1 bis 5
+        public RectangleF R;   // logische Pixel im Overlay
+
+        public Cap(string id, string label, CapSrc src, int code, float x, float y, float w, float h)
+        {
+            Id = id; Label = label; Src = src; Code = code; R = new RectangleF(x, y, w, h);
+        }
+    }
+
+    class KeyMon
+    {
+        public const int GlowMs = 140;              // Nachleuchten fuer Radimpulse
+        const int SweepMs = 500;                    // so lange muss eine Taste gehalten sein, bevor Sweep sie prueft
+        readonly bool[] keys = new bool[256];
+        readonly int[] keyAt = new int[256];
+        readonly bool[] mouse = new bool[6];        // Index 1 bis 5
+        int wheelUpUntil, wheelDownUntil, tiltLeftUntil, tiltRightUntil;
+        bool anyKey;
+        public volatile bool Dirty;
+
+        // Auto-Repeat (mehrfach down ohne up) aendert nichts und loest kein Neuzeichnen aus
+        public void Key(int vk, bool down)
+        {
+            vk &= 0xFF;
+            if (keys[vk] == down) return;
+            keys[vk] = down;
+            if (down) { keyAt[vk] = Environment.TickCount; anyKey = true; }
+            Dirty = true;
+        }
+
+        public void Mouse(int btn, bool down)
+        {
+            if (btn < 1 || btn > 5 || mouse[btn] == down) return;
+            mouse[btn] = down;
+            Dirty = true;
+        }
+
+        public void Wheel(bool horizontal, int delta, int glowMs = GlowMs)
+        {
+            if (delta == 0) return;
+            int until = Environment.TickCount + glowMs;
+            if (horizontal) { if (delta > 0) tiltRightUntil = until; else tiltLeftUntil = until; }
+            else { if (delta > 0) wheelUpUntil = until; else wheelDownUntil = until; }
+            Dirty = true;
+        }
+
+        static bool Lit(int until) { return until != 0 && until - Environment.TickCount > 0; }
+
+        public bool Down(CapSrc src, int code)
+        {
+            switch (src)
+            {
+                case CapSrc.Key:
+                    // Der Hook meldet linke/rechte Variante, die Tabelle darf auch die allgemeine nennen
+                    if (code == 0x10) return keys[0xA0] || keys[0xA1] || keys[0x10];
+                    if (code == 0x11) return keys[0xA2] || keys[0xA3] || keys[0x11];
+                    if (code == 0x12) return keys[0xA4] || keys[0xA5] || keys[0x12];
+                    return code >= 0 && code < 256 && keys[code];
+                case CapSrc.Mouse: return code >= 1 && code <= 5 && mouse[code];
+                case CapSrc.WheelUp: return Lit(wheelUpUntil);
+                case CapSrc.WheelDown: return Lit(wheelDownUntil);
+                case CapSrc.TiltLeft: return Lit(tiltLeftUntil);
+                case CapSrc.TiltRight: return Lit(tiltRightUntil);
+            }
+            return false;
+        }
+
+        // true, solange ein Radimpuls nachleuchtet
+        public bool GlowPending()
+        {
+            return Lit(wheelUpUntil) || Lit(wheelDownUntil) || Lit(tiltLeftUntil) || Lit(tiltRightUntil);
+        }
+
+        // Tasten, deren Loslassen der Hook nicht gesehen hat (Strg+Alt+Entf, UAC, Sperrbildschirm), wieder freigeben.
+        // isUp entscheidet, ob eine Taste wirklich nicht mehr gedrueckt ist; kurz gehaltene Tasten werden nicht geprueft.
+        public void Sweep(Predicate<int> isUp)
+        {
+            if (!anyKey) return;
+            bool still = false;
+            int now = Environment.TickCount;
+            for (int vk = 0; vk < 256; vk++)
+            {
+                if (!keys[vk]) continue;
+                if (now - keyAt[vk] >= SweepMs && isUp(vk)) { keys[vk] = false; Dirty = true; }
+                else still = true;
+            }
+            anyKey = still;
+        }
+
+        public void Clear()
+        {
+            Array.Clear(keys, 0, keys.Length);
+            Array.Clear(mouse, 0, mouse.Length);
+            wheelUpUntil = wheelDownUntil = tiltLeftUntil = tiltRightUntil = 0;
+            anyKey = false;
+            Dirty = true;
+        }
+    }
+
+    // Dauerhafte Tastenanzeige: klickdurchlaessig, nimmt keinen Fokus, nicht in Alt-Tab.
+    // Hintergrund echt transparent (UpdateLayeredWindow mit Alpha je Pixel), gezeichnet nur im 16-ms-Timer.
+    class KeyOverlayForm : Form
+    {
+        public const int W = 300, H = 176;   // logische Pixel bei 100 %
+
+        public static readonly Cap[] DefaultCaps = {
+            new Cap("W",         "W",         CapSrc.Key,       0x57,  62,   8,  44, 44),
+            new Cap("A",         "A",         CapSrc.Key,       0x41,  12,  56,  44, 44),
+            new Cap("S",         "S",         CapSrc.Key,       0x53,  62,  56,  44, 44),
+            new Cap("D",         "D",         CapSrc.Key,       0x44, 112,  56,  44, 44),
+            new Cap("Shift",     "Shift",     CapSrc.Key,       0x10,  12, 104,  70, 32),
+            new Cap("Strg",      "Strg",      CapSrc.Key,       0x11,  86, 104,  70, 32),
+            new Cap("Leer",      "Leertaste", CapSrc.Key,       0x20,  12, 140, 144, 28),
+            new Cap("LMB",       "L",         CapSrc.Mouse,     1,    170,   8,  42, 60),
+            new Cap("MMB",       "M",         CapSrc.Mouse,     3,    216,   8,  24, 60),
+            new Cap("RMB",       "R",         CapSrc.Mouse,     2,    244,   8,  42, 60),
+            new Cap("RadHoch",   "▲",         CapSrc.WheelUp,   0,    216,  74,  24, 20),
+            new Cap("RadRunter", "▼",         CapSrc.WheelDown, 0,    216,  98,  24, 20) };
+
+        readonly Cap[] caps;
+        readonly float dpi;
+        readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
+        KeyMon mon;
+        KeyMon previewMon;         // Beispielzustand der Vorschau, null = live
+        int previewUntil;
+        bool glowWas, dirty = true;
+        int nextSweep, nextTop;
+        // Platzierungsmodus: Rahmen sichtbar, Ziehen laeuft ueber den globalen Maus-Hook (BeginDrag/EndDrag),
+        // damit es auch klappt, wenn das Spiel im Vordergrund ist; das Fenster bleibt klickdurchlaessig
+        bool placing, dragging;
+        KeyMon placeMon;           // Beispielzustand beim Verschieben, wenn die Anzeige aus ist
+        Point dragOff;
+        readonly bool[] show;      // je Cap: anzeigen?
+        const float Pad = 8f;      // Rand um die sichtbaren Caps (logische Pixel)
+
+        // Aussehen aus dem aktiven Theme
+        Color accent = Color.FromArgb(124, 108, 255), onAccent = Color.White;
+        string family = "Segoe UI Semibold";
+        FontStyle style = FontStyle.Regular;
+        float radius = 8f;
+
+        int userScale = 100, opacity = 85, corner = 1, margin = 20;
+        Point free;                // Position bei corner == 4 (Bildschirmpixel, linke obere Ecke)
+
+        // Live = vom Benutzer eingeschaltet; sonst nur fuer die Vorschau sichtbar
+        public bool Live;
+        // Prueft fuer Sweep, ob eine Taste wirklich losgelassen ist (vom Hauptfenster gesetzt)
+        public Predicate<int> KeyIsUp;
+        // Nach dem Ziehen: neue freie Position
+        public Action<Point> Moved;
+        public bool Placing { get { return placing; } }
+        public bool Dragging { get { return dragging; } }
+
+        KeyMon ShownMon { get { return previewMon ?? (placing && !Live ? placeMon : mon); } }
+
+        public KeyOverlayForm(KeyMon mon, float dpi, Cap[] caps)
+        {
+            this.mon = mon;
+            this.dpi = dpi;
+            this.caps = (Cap[])caps.Clone();   // eigene Kopie: SetLayout verschiebt die Caps, die Vorgabe bleibt
+            show = new bool[caps.Length];
+            for (int i = 0; i < show.Length; i++) show[i] = true;
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.Manual;
+            TopMost = true;
+            Size = PixelSize();
+            timer.Interval = 16;
+            timer.Tick += Tick;
+        }
+
+        protected override bool ShowWithoutActivation { get { return true; } }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                // TOPMOST | TRANSPARENT (klickdurchlaessig) | TOOLWINDOW (nicht in Alt-Tab) | LAYERED | NOACTIVATE
+                cp.ExStyle |= 0x8 | 0x20 | 0x80 | 0x80000 | 0x08000000;
+                return cp;
+            }
+        }
+
+        float PxScale { get { return dpi * userScale / 100f; } }
+
+        // Flaeche der sichtbaren Caps plus Rand; das Fenster schrumpft darauf (Ecke sitzt buendig an den Tasten)
+        RectangleF Area()
+        {
+            RectangleF a = RectangleF.Empty;
+            bool any = false;
+            for (int i = 0; i < caps.Length; i++)
+                if (show[i]) { a = any ? RectangleF.Union(a, caps[i].R) : caps[i].R; any = true; }
+            if (!any) return new RectangleF(0, 0, W, H);
+            a.Inflate(Pad, Pad);
+            return a;
+        }
+
+        Size PixelSize()
+        {
+            RectangleF a = Area();
+            return new Size((int)Math.Ceiling(a.Width * PxScale), (int)Math.Ceiling(a.Height * PxScale));
+        }
+
+        public const float MinCapW = 16f, MinCapH = 14f;
+
+        // Eigene Anordnung: Rechteck je Cap (logische Pixel im Feld W x H)
+        public void SetLayout(RectangleF[] rs)
+        {
+            bool same = true;
+            for (int i = 0; i < caps.Length && i < rs.Length; i++)
+                if (caps[i].R != rs[i]) { caps[i].R = rs[i]; same = false; }
+            if (same) return;
+            Size = PixelSize();
+            dirty = true;
+            if (Visible && !dragging) { Place(); Render(); }
+        }
+
+        public static RectangleF[] DefaultLayout()
+        {
+            RectangleF[] r = new RectangleF[DefaultCaps.Length];
+            for (int i = 0; i < r.Length; i++) r[i] = DefaultCaps[i].R;
+            return r;
+        }
+
+        // "Id x y w h;..." (ganze logische Pixel); ohne w h bleibt die Standardgroesse,
+        // fehlende oder unbekannte Ids behalten die Vorgabe
+        public static RectangleF[] ParseLayout(string raw)
+        {
+            RectangleF[] r = DefaultLayout();
+            foreach (string s in raw.Split(';'))
+            {
+                string[] f = s.Trim().Split(' ');
+                int x, y, w = 0, h = 0;
+                if ((f.Length != 3 && f.Length != 5) || !int.TryParse(f[1], out x) || !int.TryParse(f[2], out y)) continue;
+                if (f.Length == 5 && (!int.TryParse(f[3], out w) || !int.TryParse(f[4], out h))) continue;
+                for (int i = 0; i < DefaultCaps.Length; i++)
+                    if (string.Equals(DefaultCaps[i].Id, f[0], StringComparison.OrdinalIgnoreCase))
+                    {
+                        SizeF d = DefaultCaps[i].R.Size;
+                        r[i] = ClampCap(new RectangleF(x, y, f.Length == 5 ? w : d.Width, f.Length == 5 ? h : d.Height));
+                    }
+            }
+            return r;
+        }
+
+        public static string LayoutString(RectangleF[] r)
+        {
+            List<string> o = new List<string>();
+            for (int i = 0; i < DefaultCaps.Length && i < r.Length; i++)
+                o.Add(DefaultCaps[i].Id + " " + (int)Math.Round(r[i].X) + " " + (int)Math.Round(r[i].Y)
+                    + " " + (int)Math.Round(r[i].Width) + " " + (int)Math.Round(r[i].Height));
+            return string.Join(";", o.ToArray());
+        }
+
+        // Mindestgroesse, hoechstens das Feld, ganz im Feld W x H
+        public static RectangleF ClampCap(RectangleF r)
+        {
+            r.Width = Math.Max(MinCapW, Math.Min(r.Width, W));
+            r.Height = Math.Max(MinCapH, Math.Min(r.Height, H));
+            r.X = Math.Max(0, Math.Min(r.X, W - r.Width));
+            r.Y = Math.Max(0, Math.Min(r.Y, H - r.Height));
+            return r;
+        }
+
+        public RectangleF CapRect(int i) { return caps[i].R; }
+        public bool CapShown(int i) { return show[i]; }
+
+        public void SetShown(bool[] s)
+        {
+            bool same = true;
+            for (int i = 0; i < show.Length && i < s.Length; i++) if (show[i] != s[i]) { show[i] = s[i]; same = false; }
+            if (same) return;
+            Size = PixelSize();
+            dirty = true;
+            if (Visible && !dragging) { Place(); Render(); }
+        }
+
+        public void SetLook(Color accent, Color onAccent, string family, FontStyle style, float radius)
+        {
+            if (accent == this.accent && onAccent == this.onAccent && family == this.family && style == this.style && radius == this.radius)
+                return;
+            this.accent = accent;
+            this.onAccent = onAccent;
+            this.family = family;
+            this.style = style;
+            this.radius = radius;
+            dirty = true;
+        }
+
+        public void Configure(int scalePct, int opacityPct, int corner, int margin, Point free)
+        {
+            // wird bei jedem Vordergrund-Check aufgerufen: ohne Aenderung nichts tun
+            if (scalePct == userScale && opacityPct == opacity && corner == this.corner && margin == this.margin && free == this.free)
+                return;
+            userScale = scalePct;
+            opacity = opacityPct;
+            this.corner = corner;
+            this.margin = margin;
+            this.free = free;
+            Size = PixelSize();
+            dirty = true;
+            if (Visible && !dragging) { Place(); Render(); }
+        }
+
+        // Ecke des Hauptbildschirms (0 oben links, 1 oben rechts, 2 unten links, 3 unten rechts) plus Abstand,
+        // 4 = frei (auf jedem Bildschirm; liegt sie nach einem Bildschirmwechsel daneben, wird sie hereingeschoben)
+        void Place()
+        {
+            Size s = PixelSize();
+            if (corner == 4)
+            {
+                Location = Clamp(new Rectangle(free, s)).Location;
+                return;
+            }
+            Rectangle b = Screen.PrimaryScreen.Bounds;
+            int m = (int)Math.Round(margin * dpi);
+            Location = new Point(corner % 2 == 0 ? b.Left + m : b.Right - s.Width - m,
+                                 corner < 2 ? b.Top + m : b.Bottom - s.Height - m);
+        }
+
+        // Ganz auf den Bildschirm schieben, mit dem das Rechteck am meisten ueberlappt (oder dem naechsten)
+        static Rectangle Clamp(Rectangle r)
+        {
+            Rectangle b = Screen.FromRectangle(r).Bounds;
+            r.X = Math.Max(b.Left, Math.Min(r.X, b.Right - r.Width));
+            r.Y = Math.Max(b.Top, Math.Min(r.Y, b.Bottom - r.Height));
+            return r;
+        }
+
+        // Beim Ziehen an Rand (mit eingestelltem Abstand) und Bildschirmmitte einrasten
+        Rectangle Snap(Rectangle r)
+        {
+            Rectangle b = Screen.FromRectangle(r).Bounds;
+            int m = (int)Math.Round(margin * dpi), d = (int)Math.Round(14 * dpi);
+            if (Math.Abs(r.Left - (b.Left + m)) < d) r.X = b.Left + m;
+            else if (Math.Abs(r.Right - (b.Right - m)) < d) r.X = b.Right - m - r.Width;
+            else if (Math.Abs(r.Left + r.Width / 2 - (b.Left + b.Width / 2)) < d) r.X = b.Left + (b.Width - r.Width) / 2;
+            if (Math.Abs(r.Top - (b.Top + m)) < d) r.Y = b.Top + m;
+            else if (Math.Abs(r.Bottom - (b.Bottom - m)) < d) r.Y = b.Bottom - m - r.Height;
+            else if (Math.Abs(r.Top + r.Height / 2 - (b.Top + b.Height / 2)) < d) r.Y = b.Top + (b.Height - r.Height) / 2;
+            return r;
+        }
+
+        // Verschieben ein: Rahmen zeigen; die Klicks liefert der Maus-Hook des Hauptfensters
+        public void StartPlacing(KeyMon demo)
+        {
+            placeMon = demo;
+            placing = true;
+            dirty = true;
+            Appear();
+        }
+
+        public void EndPlacing()
+        {
+            if (!placing) return;
+            if (dragging) EndDrag();
+            placing = false;
+            dirty = true;
+            if (!Live && previewMon == null) Disappear();
+        }
+
+        // Linke Taste im Rahmen gedrueckt (Bildschirmpixel); bewegt wird im Timer anhand der Zeigerposition
+        public void BeginDrag(Point screen)
+        {
+            dragging = true;
+            dragOff = new Point(screen.X - Left, screen.Y - Top);
+        }
+
+        public void EndDrag()
+        {
+            if (!dragging) return;
+            DragTo(Cursor.Position);
+            dragging = false;
+            corner = 4;
+            free = Location;
+            if (Moved != null) Moved(free);
+        }
+
+        void DragTo(Point c)
+        {
+            Point p = Snap(Clamp(new Rectangle(c.X - dragOff.X, c.Y - dragOff.Y, Width, Height))).Location;
+            if (p != Location) Location = p;
+        }
+
+        public void ShowLive()
+        {
+            Live = true;
+            mon.Clear();
+            Appear();
+        }
+
+        public void HideLive()
+        {
+            Live = false;
+            mon.Clear();
+            if (previewMon == null) Disappear();
+        }
+
+        // Kurz mit Beispielzustand zeigen (auch wenn die Anzeige aus ist)
+        public void ShowPreview(KeyMon demo, int ms)
+        {
+            previewMon = demo;
+            previewUntil = Environment.TickCount + ms;
+            dirty = true;
+            Appear();
+        }
+
+        void Appear()
+        {
+            Place();
+            dirty = true;
+            if (!Visible) Show();
+            Render();
+            // ganz nach oben, ohne zu aktivieren (0x1 NOSIZE | 0x2 NOMOVE | 0x10 NOACTIVATE | 0x40 SHOWWINDOW)
+            Native.SetWindowPos(Handle, (IntPtr)(-1), 0, 0, 0, 0, 0x1 | 0x2 | 0x10 | 0x40);
+            timer.Start();
+        }
+
+        void Disappear()
+        {
+            timer.Stop();
+            Hide();
+        }
+
+        void Tick(object sender, EventArgs e)
+        {
+            int now = Environment.TickCount;
+            if (dragging) DragTo(Cursor.Position);
+            if (previewMon != null && now - previewUntil >= 0)
+            {
+                previewMon = null;
+                dirty = true;
+                if (!Live && !placing) { Disappear(); return; }
+            }
+            if (Live && KeyIsUp != null && now - nextSweep >= 0)
+            {
+                nextSweep = now + 250;
+                mon.Sweep(KeyIsUp);
+            }
+            // Andere Fenster mit TOPMOST (z. B. ein Spiel im randlosen Modus) koennen sich davorschieben
+            if (now - nextTop >= 0)
+            {
+                nextTop = now + 2000;
+                Native.SetWindowPos(Handle, (IntPtr)(-1), 0, 0, 0, 0, 0x1 | 0x2 | 0x10);
+            }
+            KeyMon m = ShownMon;
+            bool glow = m.GlowPending();
+            // nach dem letzten Nachleuchten einmal nachzeichnen, damit das Rad wieder erlischt
+            if (dirty || m.Dirty || glow || glowWas)
+            {
+                m.Dirty = false;
+                Render();
+            }
+            glowWas = glow;
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (m.Msg == 0x007E && Visible) { Place(); Render(); }   // WM_DISPLAYCHANGE: Aufloesung/Bildschirme geaendert
+        }
+
+        // Zeichnet in ein ARGB-Bild und uebergibt es mit Alpha je Pixel an das Fenster
+        void Render()
+        {
+            dirty = false;
+            if (!IsHandleCreated) return;
+            Size s = PixelSize();
+            using (Bitmap bmp = new Bitmap(s.Width, s.Height, PixelFormat.Format32bppArgb))
+            {
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    if (placing) DrawPlacing(g, PxScale);
+                    Draw(g, ShownMon, PxScale, 1f, true);
+                }
+                IntPtr screenDc = Native.GetDC(IntPtr.Zero);
+                IntPtr memDc = Native.CreateCompatibleDC(screenDc);
+                IntPtr hBmp = bmp.GetHbitmap(Color.FromArgb(0));
+                IntPtr old = Native.SelectObject(memDc, hBmp);
+                try
+                {
+                    Native.POINT dst = new Native.POINT(); dst.X = Left; dst.Y = Top;
+                    Native.POINT src = new Native.POINT();
+                    Native.SIZE size = new Native.SIZE(); size.cx = s.Width; size.cy = s.Height;
+                    Native.BLENDFUNCTION bf = new Native.BLENDFUNCTION();
+                    bf.SourceConstantAlpha = (byte)Math.Round(opacity * 2.55);
+                    bf.AlphaFormat = 1;   // AC_SRC_ALPHA
+                    Native.UpdateLayeredWindow(Handle, screenDc, ref dst, ref size, memDc, ref src, 0, ref bf, 2);   // ULW_ALPHA
+                }
+                finally
+                {
+                    Native.SelectObject(memDc, old);
+                    Native.DeleteObject(hBmp);
+                    Native.DeleteDC(memDc);
+                    Native.ReleaseDC(IntPtr.Zero, screenDc);
+                }
+            }
+        }
+
+        // Zeichnet die sichtbaren Caps; auch fuer die Vorschau auf der Einstellungsseite und den Snapshot.
+        // alpha < 1 blendet alles ab (Deckkraft in der Seitenvorschau); crop = auf die Flaeche der sichtbaren Caps verschieben
+        public void Draw(Graphics g, KeyMon m, float sc, float alpha, bool crop)
+        {
+            GraphicsState st = g.Save();
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;   // ClearType geht auf transparentem Grund nicht
+            g.ScaleTransform(sc, sc);
+            if (crop) { RectangleF a = Area(); g.TranslateTransform(-a.X, -a.Y); }
+            {
+                for (int i = 0; i < caps.Length; i++)
+                {
+                    if (!show[i]) continue;
+                    Cap c = caps[i];
+                    // Schrift waechst/schrumpft mit der Taste (Standardgroesse = 17 bzw. 12 px)
+                    SizeF d0 = i < DefaultCaps.Length ? DefaultCaps[i].R.Size : c.R.Size;
+                    float k = Math.Max(0.6f, Math.Min(2.2f, Math.Min(c.R.Width / d0.Width, c.R.Height / d0.Height)));
+                    bool on = m.Down(c.Src, c.Code);
+                    RectangleF r = c.R;
+                    float rad = Math.Min(radius, Math.Min(r.Width, r.Height) / 2f);
+                    using (GraphicsPath p = MainForm.RR(r, rad))
+                    {
+                        using (SolidBrush b = new SolidBrush(on ? Fade(235, accent, alpha) : Fade(170, Color.FromArgb(10, 10, 12), alpha)))
+                            g.FillPath(b, p);
+                        using (Pen pen = new Pen(on ? Fade(255, Lighter(accent), alpha) : Fade(110, Color.FromArgb(200, 200, 200), alpha), 1.2f))
+                            g.DrawPath(pen, p);
+                    }
+                    float fs = (c.Label.Length == 1 && c.Src == CapSrc.Key ? 17f : 12f) * k;
+                    Color tc = on ? onAccent : Color.FromArgb(230, 230, 230);
+                    using (Font f = new Font(family, fs, style, GraphicsUnit.Pixel))
+                    using (StringFormat sf = new StringFormat())
+                    using (SolidBrush b = new SolidBrush(Fade(on ? 255 : 220, tc, alpha)))
+                    {
+                        sf.Alignment = StringAlignment.Center;
+                        sf.LineAlignment = StringAlignment.Center;
+                        sf.FormatFlags = StringFormatFlags.NoWrap;
+                        g.DrawString(c.Label, f, b, new RectangleF(r.X, r.Y + 0.5f, r.Width, r.Height), sf);
+                    }
+                }
+            }
+            g.Restore(st);
+        }
+
+        // Platzierungsmodus: getoente Flaeche und gestrichelter Rahmen um die ganze Anzeige
+        public void DrawPlacing(Graphics g, float sc)
+        {
+            GraphicsState st = g.Save();
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.ScaleTransform(sc, sc);
+            RectangleF a = Area();
+            RectangleF r = new RectangleF(1f, 1f, a.Width - 2f, a.Height - 2f);
+            using (GraphicsPath p = MainForm.RR(r, Math.Min(radius + 4, 14f)))
+            {
+                using (SolidBrush b = new SolidBrush(Color.FromArgb(150, 6, 6, 10))) g.FillPath(b, p);
+                using (SolidBrush b = new SolidBrush(Color.FromArgb(40, accent))) g.FillPath(b, p);
+                using (Pen pen = new Pen(accent, 2f))
+                {
+                    pen.DashStyle = DashStyle.Dash;
+                    g.DrawPath(pen, p);
+                }
+            }
+            g.Restore(st);
+        }
+
+        static Color Fade(int a, Color c, float alpha) { return Color.FromArgb((int)(a * alpha), c.R, c.G, c.B); }
+
+        static Color Lighter(Color c)
+        {
+            return Color.FromArgb(c.R + (255 - c.R) / 3, c.G + (255 - c.G) / 3, c.B + (255 - c.B) / 3);
+        }
+
+        // Nur zum Testen des Designs: Zustand als ARGB-PNG (transparenter Grund)
+        public void Snapshot(string path, KeyMon m, bool placingLook)
+        {
+            Size s = PixelSize();
+            using (Bitmap bmp = new Bitmap(s.Width, s.Height, PixelFormat.Format32bppArgb))
+            {
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    if (placingLook) DrawPlacing(g, PxScale);
+                    Draw(g, m, PxScale, opacity / 100f, true);
+                }
+                bmp.Save(path, ImageFormat.Png);
+            }
+        }
+
+        // Gespeichert werden die ausgeblendeten Ids, damit spaeter hinzukommende Caps sichtbar starten
+        public static bool[] ShowFromHidden(Cap[] caps, string hiddenIds)
+        {
+            bool[] s = new bool[caps.Length];
+            for (int i = 0; i < caps.Length; i++)
+            {
+                s[i] = true;
+                foreach (string id in hiddenIds.Split(','))
+                    if (string.Equals(caps[i].Id, id.Trim(), StringComparison.OrdinalIgnoreCase)) s[i] = false;
+            }
+            return s;
+        }
+
+        public static string HiddenIds(Cap[] caps, bool[] show)
+        {
+            List<string> h = new List<string>();
+            for (int i = 0; i < caps.Length; i++) if (!show[i]) h.Add(caps[i].Id);
+            return string.Join(",", h.ToArray());
+        }
+
+        // Beispielzustand fuer Vorschau und Snapshot: Caps nach Id druecken; Radimpulse leuchten glowMs lang
+        public static KeyMon Demo(Cap[] caps, string ids, int glowMs)
+        {
+            KeyMon m = new KeyMon();
+            foreach (string id in ids.Split(','))
+                foreach (Cap c in caps)
+                {
+                    if (!string.Equals(c.Id, id.Trim(), StringComparison.OrdinalIgnoreCase)) continue;
+                    switch (c.Src)
+                    {
+                        case CapSrc.Key: m.Key(c.Code, true); break;
+                        case CapSrc.Mouse: m.Mouse(c.Code, true); break;
+                        case CapSrc.WheelUp: m.Wheel(false, 120, glowMs); break;
+                        case CapSrc.WheelDown: m.Wheel(false, -120, glowMs); break;
+                        case CapSrc.TiltLeft: m.Wheel(true, -120, glowMs); break;
+                        case CapSrc.TiltRight: m.Wheel(true, 120, glowMs); break;
+                    }
+                }
+            return m;
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) timer.Dispose();
+            base.Dispose(disposing);
         }
     }
 
@@ -1250,6 +1917,9 @@ namespace PurpleClicker
         MouseBtn, RmSw, RmPrev, RmNext, RmMid, RmReset, RmBadge, RmRow, RmModel, RmRec,
         BattBtn, BtDropSw, BtToastSw, BtBootSw, BtPreview,
         ArtyBtn, ArPos, ArTgt, ArAdd, ArRow, ArRowX, ArTable, ArTabField, ArTabAdd, ArTabX,
+        KeysBtn, KsSw, KsCorner, KsMove, KsScale, KsOpacity, KsMargin, KsKey, KsCap, KsSnap, KsReset, KsPreview,
+        KsHot, KsGlobal, KsProg, KsProgX, KsProgAdd,
+        SettingsBtn, StBarSw, StProcX, StProcAdd,
         LinkDoc, LinkRepo
     }
 
@@ -1259,7 +1929,19 @@ namespace PurpleClicker
         // Layout in logischen Pixeln (wird per ScaleTransform auf den Bildschirm-DPI skaliert)
         const int W = 700, H = 506;
         static readonly Rectangle R_Title = new Rectangle(0, 0, W, 56);
-        static readonly Rectangle R_Gear = new Rectangle(574, 13, 30, 30);
+        // Titelleiste rechts: [Funktionen ...] [Farbrad] [Einstellungen] [Min] [X]; Funktionen rechtsbuendig,
+        // ausgeblendete hinterlassen keine Luecke (LayoutTitle setzt die Rechtecke, leer = nicht sichtbar)
+        static readonly Rectangle R_SettingsBtn = new Rectangle(574, 13, 30, 30);
+        Rectangle R_Gear, R_KeysBtn, R_ArtyBtn, R_BattBtn, R_MouseBtn;
+        // Symbole in der Leiste (Reihenfolge links -> rechts), zugehoerige Seite (-1 = Theme-Auswahl, keine Seite)
+        const int BarCount = 5, BAR_THEME = 4;
+        static readonly string[] BarNames = { "Tastenanzeige", "Artillerie-Rechner (Wardogs)", "Akku", "Maus-Umbelegung", "Theme-Auswahl" };
+        static readonly int[] BarPage = { 4, 3, 2, 1, -1 };
+        static readonly string[] BarKeys = { "BarKeys", "BarArty", "BarBatt", "BarMouse", "BarTheme" };   // INI-Schluessel
+        readonly bool[] barShow = { true, true, true, true, true };
+        readonly List<string>[] barProcs = new List<string>[BarCount];   // nur wenn eines laeuft (im Konstruktor angelegt)
+        readonly bool[] barRunning = new bool[BarCount];   // eines der Programme laeuft gerade
+        readonly System.Windows.Forms.Timer procTimer = new System.Windows.Forms.Timer();
         static readonly Rectangle R_ThemePanel = new Rectangle(500, 50, 180, 268);
         const int THEME_ROW = 40, THEME_Y0 = 62;
         // Links neben dem Titel; Rechtecke werden beim Zeichnen anhand der Textbreite gesetzt
@@ -1287,11 +1969,40 @@ namespace PurpleClicker
         static readonly Rectangle R_HotPill = new Rectangle(446, 197, 218, 34);
         static readonly Rectangle R_HotBtn = new Rectangle(582, 200, 76, 28);
 
-        // Autostart sitzt in der Titelleiste
-        static readonly Rectangle R_AutoHit = new Rectangle(300, 13, 142, 30);
-        static readonly Rectangle R_AutoSw = new Rectangle(398, 16, 44, 24);
+        // Einstellungsseite: Autostart, darunter je Funktion Schalter fuer die Leiste und "nur wenn laeuft"
+        static readonly Rectangle R_StCard = new Rectangle(20, 64, 660, 428);
+        static readonly Rectangle R_StAutoSw = new Rectangle(620, 96, 44, 24);
+        const int ST_ROW_Y0 = 170, ST_ROW = 64, ST_CHIP_DY = 32, ST_CHIP_X0 = 186, ST_CHIP_X1 = 664, ST_CHIP_H = 24;
+        readonly List<Rectangle>[] stChipRects = new List<Rectangle>[BarCount];
+        readonly Rectangle[] stAddRects = new Rectangle[BarCount];
+        const int MAX_BAR_PROCS = 4;
+        // Tastenanzeige-Seite: oben Schalter, links Vorschau, rechts Position und Schieber
+        static readonly Rectangle R_KsCard = new Rectangle(20, 64, 660, 374);
+        static readonly Rectangle R_KsSw = new Rectangle(620, 96, 44, 24);
+        static readonly Rectangle R_KsPrevBtn = new Rectangle(330, 94, 96, 28);   // Vorschau
+        static readonly Rectangle R_KsHot = new Rectangle(436, 94, 168, 28);      // Hotkey zum An-/Ausschalten
+        // Unten statt Start-Knopf: "Ueberall" + Programme (Chip waehlt, wessen Position man einstellt)
+        static readonly Rectangle R_KsProgBar = new Rectangle(20, 450, 660, 42);
+        static readonly Rectangle R_KsGlobalSw = new Rectangle(36, 459, 44, 24);
+        static readonly Rectangle R_KsGlobalHit = new Rectangle(30, 452, 128, 38);
+        const int KS_CHIP_X0 = 172, KS_CHIP_X1 = 664, KS_CHIP_Y = 458, KS_CHIP_H = 26;
+        static readonly Rectangle R_KsPrev = new Rectangle(36, 144, KeyOverlayForm.W, KeyOverlayForm.H);
+        static readonly Rectangle R_KsScreen = new Rectangle(584, 144, 80, 48);   // Mini-Bildschirm, je Viertel eine Ecke
+        const int KS_COL_X = 368, KS_SL_X = 376, KS_SL_W = 280;
+        static readonly Rectangle R_KsMove = new Rectangle(KS_COL_X, 204, 296, 28);   // "Frei verschieben" / "Fertig"
+        static readonly int[] KsRowY = { 244, 298, 352 };                        // Groesse, Deckkraft, Abstand (Text; Schieber +34)
+        // Schalter je Taste unter der Vorschau: Spalten W-D | Shift/Strg/Leer | Maus und Rad
+        static readonly int[] KsKeyCol = { 0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 2 };    // Spalte je Cap (Reihenfolge wie DefaultCaps)
+        static readonly int[] KsColX = { 36, 124, 236 }, KsColW = { 88, 112, 100 };
+        static readonly string[] KsKeyNames = { "W", "A", "S", "D", "Shift", "Strg", "Leertaste", "Links", "Mitte", "Rechts", "Rad ▲", "Rad ▼" };
+        const int KS_KEY_Y0 = 332, KS_KEY_ROW = 19;
+        // Unterste Zeile rechts: Einrasten beim Anordnen, Anordnung zuruecksetzen
+        static readonly Rectangle R_KsSnapSw = new Rectangle(KS_COL_X, 402, 44, 24);
+        static readonly Rectangle R_KsSnapHit = new Rectangle(KS_COL_X, 402, 150, 24);
+        static readonly Rectangle R_KsReset = new Rectangle(560, 402, 104, 24);
+        const int KS_GRID = 4;                                                   // Raster beim Anordnen (logische Pixel)
+        const float KS_SNAP = 5f;                                                // Fangabstand der Hilfslinien
         // Artillerie-Seite: links Felder + Ergebnis, rechts Zielliste, unten Knopf fuer die Schusstafel
-        static readonly Rectangle R_ArtyBtn = new Rectangle(460, 13, 30, 30);
         static readonly Rectangle R_ArCard = new Rectangle(20, 64, 660, 374);
         static readonly Rectangle R_ArPos = new Rectangle(118, 98, 302, 36);
         static readonly Rectangle R_ArTgt = new Rectangle(118, 142, 302, 36);
@@ -1305,14 +2016,12 @@ namespace PurpleClicker
         static readonly Rectangle R_ArTabList = new Rectangle(130, 146, 440, 186);
         const int AR_TAB_ROW = 31, AR_TAB_ROWS = 6;
         // Akku-Seite
-        static readonly Rectangle R_BattBtn = new Rectangle(498, 13, 30, 30);
         static readonly Rectangle R_BtCard = new Rectangle(20, 64, 660, 374);
         const int BT_Y0 = 100, BT_ROW = 60;                                      // Geraetezeilen
         static readonly Rectangle R_BtDropSw = new Rectangle(620, 290, 44, 24);
         static readonly Rectangle R_BtToastSw = new Rectangle(620, 334, 44, 24);
         static readonly Rectangle R_BtBootSw = new Rectangle(620, 378, 44, 24);
         // Maus-Seite (Umbelegung)
-        static readonly Rectangle R_MouseBtn = new Rectangle(536, 13, 30, 30);
         static readonly Rectangle R_RmCard = new Rectangle(20, 64, 660, 374);
         static readonly Rectangle R_RmSw = new Rectangle(620, 72, 44, 24);
         const int RM_Y0 = 108, RM_ROW = 35, RM_H = 30, RM_PILL_X = 424, RM_PILL_W = 236, RM_ARROW = 34;
@@ -1568,7 +2277,7 @@ namespace PurpleClicker
 
         Hotkey hotkey = new Hotkey(false, (int)Keys.F6);
         readonly Remapper remap = new Remapper();   // Maus-Umbelegung
-        int page;                                   // 0 = Hauptseite, 1 = Maus-Umbelegung, 2 = Akku, 3 = Artillerie
+        int page;                                   // 0 = Hauptseite, 1 = Maus-Umbelegung, 2 = Akku, 3 = Artillerie, 4 = Tastenanzeige
         int rmSel = -1;                             // im Mausbild gewaehlte Eingabe
         int mouseView;                              // 0 Auto, 1 Foto, 2 gezeichnet (5 Tasten), 3 gezeichnet (3 Tasten)
         Bitmap mousePhoto;                          // aus der exe, null wenn nicht eingebettet
@@ -1588,7 +2297,7 @@ namespace PurpleClicker
         int intervalMs = 100;
         bool editing;
         string editBuf = "";
-        int dragKind;              // 0 = nichts, 1 = Intervall-Slider, 2 = Multiplikator-Slider, 3 = Meldungsdauer
+        int dragKind;              // 0 = nichts, 1 = Intervall-Slider, 2 = Multiplikator-Slider, 3 = Meldungsdauer, 4..6 = Tastenanzeige, 7 = Taste anordnen
         int overlaySec = 5;        // Anzeigedauer des Overlays (1-10 s)
         bool multiOn;
         int multiplier = 5;
@@ -1631,6 +2340,43 @@ namespace PurpleClicker
         const int BattMsgSec = 12;        // Anzeigedauer der Akku-Meldungen, unabhaengig vom Schieber "MELDUNG"
         const int ToastSec = 6;           // Anzeigedauer der Windows-Benachrichtigung bei 30/10 %
 
+        // Tastenanzeige
+        readonly KeyMon keyMon = new KeyMon();
+        KeyOverlayForm keysOverlay;
+        bool keysOn;
+        // Bildschirmposition: Standard und je Programm eine eigene
+        class KeysPlace
+        {
+            public int Corner = 1;        // 0 oben links, 1 oben rechts, 2 unten links, 3 unten rechts, 4 frei
+            public int X, Y;              // freie Position in Bildschirmpixeln (bei Corner == 4)
+            public KeysPlace Copy() { KeysPlace k = new KeysPlace(); k.Corner = Corner; k.X = X; k.Y = Y; return k; }
+        }
+        readonly KeysPlace keysStd = new KeysPlace();
+        readonly List<string> keysPrograms = new List<string>();                              // Reihenfolge der Chips
+        readonly Dictionary<string, KeysPlace> keysPlaces = new Dictionary<string, KeysPlace>();
+        const int MAX_KEYS_PROGRAMS = 6;
+        string keysEdit;                  // auf der Seite gewaehlte Position (null = Standard)
+        string keysFgProg;                // Programm im Vordergrund, falls in der Liste (eigenes Fenster: letzter Stand)
+        bool keysGlobal = true;           // ueberall anzeigen; aus = nur in den gewaehlten Programmen
+        Hotkey keysKey = new Hotkey(false, 0);   // schaltet die Tastenanzeige an/aus (Code 0 = keiner)
+        int popTarget;                    // Programm-Auswahl fuellt: 0 Autoclicker, 1 Tastenanzeige, 10 + f "nur wenn laeuft" der Funktion f
+        readonly List<Rectangle> ksChipRects = new List<Rectangle>();   // 0 = Standard, dann je Programm
+        Rectangle ksAddRect = Rectangle.Empty;
+        bool[] keysShow = KeyOverlayForm.ShowFromHidden(KeyOverlayForm.DefaultCaps, "");   // je Cap: anzeigen?
+        RectangleF[] keysPos = KeyOverlayForm.DefaultLayout();   // je Cap: Position und Groesse (eigene Anordnung)
+        int ksDragCap = -1;               // in der Vorschau gezogene Taste
+        int ksDragEdge;                   // gegriffener Rand (0 = verschieben), siehe KsCapAt
+        RectangleF ksDragStart;           // Rechteck beim Greifen
+        Point ksDragP0;                   // Zeiger beim Greifen
+        int ksHitEdge, ksHoverEdge;       // Rand unter dem Zeiger (fuer den Mauszeiger)
+        bool keysSnap = true;             // beim Anordnen an anderen Tasten und im Raster einrasten
+        readonly List<float> ksGuideX = new List<float>(), ksGuideY = new List<float>();   // eingerastete Achsen (Vorschau-Koordinaten)
+        int keysMargin = 20;              // logische Pixel zum Bildschirmrand, 0 bis 200
+        int keysScale = 100;              // Prozent, 60 bis 200
+        int keysOpacity = 85;             // Prozent, 20 bis 100
+        const string KeysDemo = "W,Shift,LMB,RadHoch";
+        const int KeysPreviewMs = 3000;
+
         // Artillerie-Rechner
         readonly string[] arText = { "", "", "" };                        // Feldinhalt: 0 Position, 1 Ziel, 2 Tafel-Eingabe
         readonly double[] arX = { double.NaN, double.NaN }, arY = { double.NaN, double.NaN };
@@ -1647,6 +2393,7 @@ namespace PurpleClicker
         {
             this.startHidden = hidden;
             this.bootStart = hidden;
+            for (int f = 0; f < BarCount; f++) { barProcs[f] = new List<string>(); stChipRects[f] = new List<Rectangle>(); }
             this.noServices = noServices;
             using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) scale = g.DpiX / 96f;
             settingsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.ini");
@@ -1673,6 +2420,8 @@ namespace PurpleClicker
             };
             fgTimer.Interval = 250;
             fgTimer.Tick += delegate { ForegroundTick(); };
+            procTimer.Interval = 2000;
+            procTimer.Tick += delegate { BarCheck(); };
             rainbowTimer.Interval = 70;
             rainbowTimer.Tick += delegate
             {
@@ -1680,6 +2429,7 @@ namespace PurpleClicker
                 if (!Visible || WindowState == FormWindowState.Minimized) return;
                 rbPhase = (rbPhase + 2.2f) % 360f;
                 RainbowColors();
+                if (keysOn && keysOverlay != null && !keysOverlay.IsDisposed) KeysLook(keysOverlay);
                 Invalidate();
             };
 
@@ -1768,6 +2518,11 @@ namespace PurpleClicker
             rmItem.Click += delegate { SetRemapOn(rmItem.Checked); };
             menu.Opening += delegate { rmItem.Checked = remap.On; };
             menu.Items.Add(rmItem);
+            ToolStripMenuItem ksItem = new ToolStripMenuItem("Tastenanzeige");
+            ksItem.CheckOnClick = true;
+            ksItem.Click += delegate { SetKeysOn(ksItem.Checked); };
+            menu.Opening += delegate { ksItem.Checked = keysOn; };
+            menu.Items.Add(ksItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Dokumentation", null, delegate { OpenUrl(DocUrl); });
             menu.Items.Add("Quellcode auf GitHub", null, delegate { OpenUrl(RepoUrl); });
@@ -1798,8 +2553,10 @@ namespace PurpleClicker
             }
             catch { }
 
+            if (keysOn) SetKeysOn(true);
             UpdateFgTimer();
             ForegroundTick();
+            BarCheck();
 
             RegisterToastAppId();
             if (battToastMsg) AllowToastInFullscreen();
@@ -1829,6 +2586,359 @@ namespace PurpleClicker
             Invalidate();
         }
 
+        // ---------------------------------------------------------- Titelleiste / Einstellungen
+        // Symbol f sichtbar: eingeschaltet und (keine Programme gewaehlt oder eines davon laeuft)
+        bool BarVisible(int f)
+        {
+            return barShow[f] && (barProcs[f].Count == 0 || barRunning[f]);
+        }
+
+        void LayoutTitle()
+        {
+            Rectangle[] r = new Rectangle[BarCount];
+            int x = R_SettingsBtn.X - 38;   // 8 px Abstand wie zwischen den uebrigen Knoepfen
+            for (int f = BarCount - 1; f >= 0; f--)
+            {
+                if (!BarVisible(f)) continue;
+                r[f] = new Rectangle(x, 13, 30, 30);
+                x -= 38;
+            }
+            R_KeysBtn = r[0]; R_ArtyBtn = r[1]; R_BattBtn = r[2]; R_MouseBtn = r[3]; R_Gear = r[BAR_THEME];
+        }
+
+        // Laufende Programme fuer "nur wenn laeuft" pruefen. Die Prozessliste kostet einige ms und laeuft deshalb
+        // im Hintergrund: im UI-Thread wuerde sie die Eingabe-Hooks bremsen
+        bool procScanBusy;
+
+        void BarCheck()
+        {
+            bool need = false;
+            for (int f = 0; f < BarCount; f++) need |= barProcs[f].Count > 0;
+            procTimer.Enabled = need && servicesStarted && !exiting;
+            if (!need) { BarApply(new bool[BarCount]); return; }
+            if (procScanBusy || !IsHandleCreated) return;
+            procScanBusy = true;
+            List<string>[] lists = new List<string>[BarCount];
+            for (int f = 0; f < BarCount; f++) lists[f] = new List<string>(barProcs[f]);
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                bool[] res = new bool[BarCount];
+                try
+                {
+                    HashSet<string> run = new HashSet<string>();
+                    foreach (Process p in Process.GetProcesses())
+                    {
+                        try { run.Add(p.ProcessName.ToLowerInvariant() + ".exe"); } catch { }
+                        p.Dispose();
+                    }
+                    for (int f = 0; f < BarCount; f++)
+                        foreach (string ex in lists[f]) if (run.Contains(ex)) { res[f] = true; break; }
+                }
+                catch { }
+                try { BeginInvoke((MethodInvoker)delegate { procScanBusy = false; BarApply(res); }); }
+                catch { procScanBusy = false; }
+            });
+        }
+
+        // Ergebnis uebernehmen; offene Seite einer jetzt ausgeblendeten Funktion schliessen
+        void BarApply(bool[] running)
+        {
+            if (exiting) return;
+            bool changed = false;
+            for (int f = 0; f < BarCount; f++)
+                if (running[f] != barRunning[f]) { barRunning[f] = running[f]; changed = true; }
+            for (int f = 0; f < BarCount; f++)
+                if (page == BarPage[f] && !BarVisible(f)) { EndRecording(false); EndKeysPlacing(); page = 0; popupOpen = false; changed = true; }
+            if (themeOpen && !BarVisible(BAR_THEME)) { themeOpen = false; changed = true; }
+            if (changed && Visible) Invalidate();
+        }
+
+        // ---------------------------------------------------------- Tastenanzeige
+        KeyOverlayForm KeysOverlay()
+        {
+            if (keysOverlay == null || keysOverlay.IsDisposed)
+            {
+                keysOverlay = new KeyOverlayForm(keyMon, scale, KeyOverlayForm.DefaultCaps);
+                // Haengende Taste nur freigeben, wenn sie nicht von uns verschluckt wurde (dann meldet Windows sie als oben)
+                keysOverlay.KeyIsUp = delegate(int vk) { return !swallowedKeys.Contains(vk) && (Native.GetAsyncKeyState(vk) & 0x8000) == 0; };
+                keysOverlay.Moved = delegate(Point p)
+                {
+                    // Verschoben wird immer die auf der Seite gewaehlte Position
+                    KeysPlace k = PlaceOf(keysEdit);
+                    k.Corner = 4;
+                    k.X = p.X;
+                    k.Y = p.Y;
+                    SaveSettings();
+                    Invalidate();
+                };
+                ConfigureKeys(keysOverlay);
+                keysOverlay.SetShown(keysShow);
+                keysOverlay.SetLayout(keysPos);
+            }
+            KeysLook(keysOverlay);
+            return keysOverlay;
+        }
+
+        KeysPlace PlaceOf(string prog)
+        {
+            KeysPlace k;
+            return prog != null && keysPlaces.TryGetValue(prog, out k) ? k : keysStd;
+        }
+
+        // Welche Position gerade gilt: beim Einstellen (Verschieben oder Seite im Vordergrund) die gewaehlte,
+        // sonst die des Programms im Vordergrund bzw. der Standard
+        string KeysProfileNow()
+        {
+            if (KeysPlacing || (page == 4 && Visible && OwnForeground())) return keysEdit;
+            return keysFgProg;
+        }
+
+        static bool OwnForeground()
+        {
+            uint pid;
+            IntPtr fg = Native.GetForegroundWindow();
+            return fg != IntPtr.Zero && Native.GetWindowThreadProcessId(fg, out pid) != 0 && pid == OwnPid;
+        }
+
+        void ConfigureKeys(KeyOverlayForm o)
+        {
+            KeysPlace k = PlaceOf(KeysProfileNow());
+            o.Configure(keysScale, keysOpacity, k.Corner, keysMargin, new Point(k.X, k.Y));
+        }
+
+        // Sichtbarkeit und Position nachfuehren (Vordergrund gewechselt, Seite gewechselt, Einstellung geaendert).
+        // Ohne "Ueberall" nur in den gewaehlten Programmen und auf der eigenen Seite der Tastenanzeige
+        void KeysApply()
+        {
+            if (!keysOn && (keysOverlay == null || keysOverlay.IsDisposed)) return;
+            try
+            {
+                KeyOverlayForm o = KeysOverlay();
+                ConfigureKeys(o);
+                bool want = keysOn && (keysGlobal || (OwnForeground() ? page == 4 && Visible : keysFgProg != null));
+                if (want && !o.Live) o.ShowLive();
+                else if (!want && o.Live) o.HideLive();
+            }
+            catch { }
+        }
+
+        // Hotkey der Tastenanzeige: ganze Funktion an/aus, mit kurzer Meldung
+        void ToggleKeysByHotkey()
+        {
+            SetKeysOn(!keysOn);
+            try
+            {
+                if (overlay == null || overlay.IsDisposed) overlay = new OverlayForm(logo, scale);
+                IntPtr fg = Native.GetForegroundWindow();
+                overlay.ShowMessage("Tastenanzeige " + (keysOn ? "an" : "aus"), keysKey.Short(),
+                    fg != IntPtr.Zero ? Screen.FromHandle(fg) : Screen.PrimaryScreen, 2);
+            }
+            catch { }
+        }
+
+        // Akzentfarbe, Schrift und Ecken des aktiven Themes
+        internal static void KeysLook(KeyOverlayForm f)
+        {
+            f.SetLook(C_Accent, C_OnAccent, famBtn, styleSemi, radCtl < 0 ? 14f : radCtl + 2);   // Pillen-Themes: W/A/S/D nicht kreisrund
+        }
+
+        void SetKeysOn(bool on)
+        {
+            keysOn = on;
+            keyMon.Clear();   // Ein- und Ausschalten startet immer leer
+            UpdateFgTimer();
+            if (on) ForegroundTick();   // Vordergrund sofort bestimmen (Programm-Position, Sichtbarkeit)
+            KeysApply();
+            SaveSettings();
+            Invalidate();
+        }
+
+        // Ecke, Groesse, Deckkraft oder Abstand geaendert: live uebernehmen, bei ausgeschalteter Anzeige kurz zeigen
+        void KeysChanged(bool preview)
+        {
+            try
+            {
+                KeyOverlayForm o = KeysOverlay();
+                ConfigureKeys(o);
+                o.SetShown(keysShow);
+                o.SetLayout(keysPos);
+                if (preview && !keysOn && !o.Placing) o.ShowPreview(KeyOverlayForm.Demo(KeyOverlayForm.DefaultCaps, KeysDemo, KeysPreviewMs), 1500);
+            }
+            catch { }
+        }
+
+        bool KeysPlacing { get { return keysOverlay != null && !keysOverlay.IsDisposed && keysOverlay.Placing; } }
+
+        // Frei verschieben: Overlay wird greifbar; Ende ueber "Fertig", Enter/Esc, Seitenwechsel oder Verlassen des Fensters
+        void ToggleKeysPlacing()
+        {
+            try
+            {
+                if (KeysPlacing) EndKeysPlacing();
+                else
+                {
+                    KeyOverlayForm o = KeysOverlay();
+                    o.Configure(keysScale, keysOpacity, PlaceOf(keysEdit).Corner, keysMargin, new Point(PlaceOf(keysEdit).X, PlaceOf(keysEdit).Y));
+                    o.StartPlacing(KeyOverlayForm.Demo(KeyOverlayForm.DefaultCaps, KeysDemo, int.MaxValue / 2));
+                }
+            }
+            catch { }
+            Invalidate();
+        }
+
+        void EndKeysPlacing()
+        {
+            if (!KeysPlacing) return;
+            keysOverlay.EndPlacing();
+            KeysApply();   // zurueck auf die Position, die jetzt gilt
+            Invalidate();
+        }
+
+        void KeysPreview()
+        {
+            try { KeysOverlay().ShowPreview(KeyOverlayForm.Demo(KeyOverlayForm.DefaultCaps, KeysDemo, KeysPreviewMs), KeysPreviewMs); }
+            catch { }
+        }
+
+        // Taste der Vorschau unter p (oberste zuerst, wie gezeichnet), -1 = keine.
+        // edges: Rand, an dem gegriffen wurde (1 links, 2 rechts, 4 oben, 8 unten; 0 = Mitte = verschieben)
+        int KsCapAt(Point p, out int edges)
+        {
+            edges = 0;
+            for (int i = keysPos.Length - 1; i >= 0; i--)
+            {
+                if (!keysShow[i]) continue;
+                RectangleF r = keysPos[i];
+                r.Offset(R_KsPrev.X, R_KsPrev.Y);
+                RectangleF outer = r;
+                outer.Inflate(3f, 3f);   // Rand auch knapp ausserhalb greifbar
+                if (!outer.Contains(p)) continue;
+                float bx = Math.Min(5f, r.Width / 4f), by = Math.Min(5f, r.Height / 4f);
+                if (p.X < r.X + bx) edges |= 1; else if (p.X >= r.Right - bx) edges |= 2;
+                if (p.Y < r.Y + by) edges |= 4; else if (p.Y >= r.Bottom - by) edges |= 8;
+                return i;
+            }
+            return -1;
+        }
+
+        static Cursor KsCursor(int edges)
+        {
+            if (edges == 0) return Cursors.SizeAll;
+            bool h = (edges & 3) != 0, v = (edges & 12) != 0;
+            if (h && v) return edges == (1 | 4) || edges == (2 | 8) ? Cursors.SizeNWSE : Cursors.SizeNESW;
+            return h ? Cursors.SizeWE : Cursors.SizeNS;
+        }
+
+        static float KsSnap(float v) { return (float)Math.Round(v / KS_GRID) * KS_GRID; }
+
+        // Fanglinien fuer Taste i: Kanten und Mitten der anderen sichtbaren Tasten sowie die Mitte ihrer Gesamtflaeche
+        void KsGuideCands(int i, List<float> xs, List<float> ys)
+        {
+            RectangleF all = RectangleF.Empty;
+            bool any = false;
+            for (int j = 0; j < keysPos.Length; j++)
+            {
+                if (j == i || !keysShow[j]) continue;
+                RectangleF o = keysPos[j];
+                xs.Add(o.Left); xs.Add(o.Left + o.Width / 2f); xs.Add(o.Right);
+                ys.Add(o.Top); ys.Add(o.Top + o.Height / 2f); ys.Add(o.Bottom);
+                all = any ? RectangleF.Union(all, o) : o;
+                any = true;
+            }
+            if (any) { xs.Add(all.Left + all.Width / 2f); ys.Add(all.Top + all.Height / 2f); }
+        }
+
+        // Position einer Achse: mit Einrasten an der naechsten Fanglinie (ueber Anfang, Mitte oder Ende der Taste),
+        // sonst im Raster; ohne Einrasten pixelgenau. offs = gepruefte Stellen relativ zu pos
+        float KsAxis(float pos, float[] offs, List<float> cands)
+        {
+            if (!keysSnap) return (float)Math.Round(pos);
+            float best = float.MaxValue, delta = 0;
+            foreach (float off in offs)
+                foreach (float c in cands)
+                {
+                    float d = c - (pos + off);
+                    if (Math.Abs(d) <= KS_SNAP && Math.Abs(d) < Math.Abs(best)) { best = d; delta = d; }
+                }
+            return best != float.MaxValue ? pos + delta : KsSnap(pos);
+        }
+
+        // Nach dem Einrasten: welche Fanglinien die Taste jetzt beruehrt (fuer die angezeigten X/Y-Achsen)
+        static void KsCollect(float[] vals, List<float> cands, List<float> guides)
+        {
+            foreach (float v in vals)
+                foreach (float c in cands)
+                    if (Math.Abs(c - v) < 0.5f && !guides.Contains(c)) guides.Add(c);
+        }
+
+        // Gezogene Taste verschieben bzw. am gegriffenen Rand in der Groesse aendern; das Overlay uebernimmt sofort
+        void KsCapTo(Point p)
+        {
+            if (ksDragCap < 0) return;
+            RectangleF s = ksDragStart, r;
+            float dx = p.X - ksDragP0.X, dy = p.Y - ksDragP0.Y;
+            const float mw = KeyOverlayForm.MinCapW, mh = KeyOverlayForm.MinCapH;
+            List<float> cx = new List<float>(), cy = new List<float>();
+            if (keysSnap) KsGuideCands(ksDragCap, cx, cy);
+            float[] one = { 0f };
+            if (ksDragEdge == 0)
+            {
+                float x = KsAxis(s.X + dx, new float[] { 0f, s.Width / 2f, s.Width }, cx);
+                float y = KsAxis(s.Y + dy, new float[] { 0f, s.Height / 2f, s.Height }, cy);
+                r = KeyOverlayForm.ClampCap(new RectangleF(x, y, s.Width, s.Height));
+            }
+            else
+            {
+                float x1 = s.X, x2 = s.Right, y1 = s.Y, y2 = s.Bottom;
+                if ((ksDragEdge & 1) != 0) x1 = Math.Max(0, Math.Min(KsAxis(s.X + dx, one, cx), x2 - mw));
+                if ((ksDragEdge & 2) != 0) x2 = Math.Min(KeyOverlayForm.W, Math.Max(KsAxis(s.Right + dx, one, cx), x1 + mw));
+                if ((ksDragEdge & 4) != 0) y1 = Math.Max(0, Math.Min(KsAxis(s.Y + dy, one, cy), y2 - mh));
+                if ((ksDragEdge & 8) != 0) y2 = Math.Min(KeyOverlayForm.H, Math.Max(KsAxis(s.Bottom + dy, one, cy), y1 + mh));
+                r = new RectangleF(x1, y1, x2 - x1, y2 - y1);
+            }
+
+            ksGuideX.Clear();
+            ksGuideY.Clear();
+            if (keysSnap)
+            {
+                if (ksDragEdge == 0)
+                {
+                    KsCollect(new float[] { r.Left, r.Left + r.Width / 2f, r.Right }, cx, ksGuideX);
+                    KsCollect(new float[] { r.Top, r.Top + r.Height / 2f, r.Bottom }, cy, ksGuideY);
+                }
+                else
+                {
+                    if ((ksDragEdge & 1) != 0) KsCollect(new float[] { r.Left }, cx, ksGuideX);
+                    if ((ksDragEdge & 2) != 0) KsCollect(new float[] { r.Right }, cx, ksGuideX);
+                    if ((ksDragEdge & 4) != 0) KsCollect(new float[] { r.Top }, cy, ksGuideY);
+                    if ((ksDragEdge & 8) != 0) KsCollect(new float[] { r.Bottom }, cy, ksGuideY);
+                }
+            }
+            Invalidate();
+            if (r == keysPos[ksDragCap]) return;
+            keysPos[ksDragCap] = r;
+            try { KeysOverlay().SetLayout(keysPos); } catch { }
+        }
+
+        bool KsLayoutIsDefault()
+        {
+            RectangleF[] d = KeyOverlayForm.DefaultLayout();
+            for (int i = 0; i < d.Length; i++) if (d[i] != keysPos[i]) return false;
+            return true;
+        }
+
+        // Schieber der Tastenanzeige: 4 Groesse, 5 Deckkraft, 6 Abstand
+        void KsSliderTo(int kind, int x)
+        {
+            double t = Math.Min(Math.Max((x - KS_SL_X) / (double)KS_SL_W, 0), 1);
+            int old;
+            if (kind == 4) { old = keysScale; keysScale = 60 + (int)Math.Round(t * 14) * 10; if (old == keysScale) return; }
+            else if (kind == 5) { old = keysOpacity; keysOpacity = 20 + (int)Math.Round(t * 16) * 5; if (old == keysOpacity) return; }
+            else { old = keysMargin; keysMargin = (int)Math.Round(t * 20) * 10; if (old == keysMargin) return; }
+            KeysChanged(true);
+            Invalidate();
+        }
+
         void ShowFromTray()
         {
             startHidden = false;
@@ -1850,6 +2960,7 @@ namespace PurpleClicker
                 // X versteckt nur ins Tray (Beenden ueber das Tray-Menue)
                 e.Cancel = true;
                 if (popupOpen) popupOpen = false;
+                EndKeysPlacing();
                 SaveSettings();
                 Hide();
                 return;
@@ -1858,12 +2969,15 @@ namespace PurpleClicker
             exiting = true;
             SaveSettings();
             fgTimer.Stop();
+            procTimer.Stop();
             rainbowTimer.Stop();
             Battery.Stop();
             clicker.SetRunning(false);
             clicker.Dispose();
             remap.On = false;
             remap.ReleaseAll();
+            keyMon.Clear();
+            if (keysOverlay != null && !keysOverlay.IsDisposed) keysOverlay.Close();
             if (showEvent != null) { try { showEvent.Set(); } catch { } }
             if (notify != null) { notify.Visible = false; notify.Dispose(); notify = null; }
             if (mouseHook != IntPtr.Zero) Native.UnhookWindowsHookEx(mouseHook);
@@ -1971,6 +3085,7 @@ namespace PurpleClicker
 
         bool HandleWheel(bool horizontal, int delta, Point pt)
         {
+            if (keysOn) keyMon.Wheel(horizontal, delta);   // Tastenanzeige: vor allen Returns, nur Array + Flag
             if (recording)
             {
                 int w = horizontal ? (delta < 0 ? 7 : 8) : (delta > 0 ? 5 : 6);
@@ -1984,6 +3099,18 @@ namespace PurpleClicker
 
         bool HandleMouse(int btn, bool down, Point pt)
         {
+            if (keysOn) keyMon.Mouse(btn, down);   // auch geschluckte Hotkeys und umbelegte Tasten anzeigen
+            // Tastenanzeige verschieben: Linksklick im Rahmen abfangen (kommt nie im Spiel an), gezogen wird im Overlay-Timer
+            if (btn == 1 && KeysPlacing)
+            {
+                if (down && keysOverlay.Bounds.Contains(pt))
+                {
+                    keysOverlay.BeginDrag(pt);
+                    swallowUp[1] = true;
+                    return true;
+                }
+                if (!down && keysOverlay.Dragging) keysOverlay.EndDrag();
+            }
             if (!down)
             {
                 if (swallowUp[btn]) { swallowUp[btn] = false; return true; }
@@ -2015,6 +3142,12 @@ namespace PurpleClicker
                 Invalidate();
                 return true;
             }
+            if (keysKey.Code != 0 && keysKey.IsMouse && keysKey.Code == btn)
+            {
+                swallowUp[btn] = true;
+                ToggleKeysByHotkey();
+                return true;
+            }
             if (!active) return false;
             if (hotkey.IsMouse && hotkey.Code == btn)
             {
@@ -2038,9 +3171,21 @@ namespace PurpleClicker
             {
                 hotkey = new Hotkey(isMouse, code);
                 if (mulKey.IsMouse == isMouse && mulKey.Code == code) mulKey = new Hotkey(false, 0);
+                if (keysKey.IsMouse == isMouse && keysKey.Code == code) keysKey = new Hotkey(false, 0);
             }
-            else if (!(hotkey.IsMouse == isMouse && hotkey.Code == code))
+            else if (capTarget == 1)
+            {
+                if (hotkey.IsMouse == isMouse && hotkey.Code == code) return;
                 mulKey = new Hotkey(isMouse, code);
+                if (keysKey.IsMouse == isMouse && keysKey.Code == code) keysKey = new Hotkey(false, 0);
+            }
+            else
+            {
+                // Tastenanzeige: weder Start/Stop- noch Multiplikator-Hotkey ueberschreiben
+                if ((hotkey.IsMouse == isMouse && hotkey.Code == code) || (mulKey.IsMouse == isMouse && mulKey.Code == code)) return;
+                keysKey = new Hotkey(isMouse, code);
+                SaveSettings();
+            }
         }
 
         void ToggleMulti()
@@ -2076,8 +3221,16 @@ namespace PurpleClicker
 
         bool HandleKey(int vk, bool down)
         {
+            if (keysOn) keyMon.Key(vk, down);
             if (!down)
                 return swallowedKeys.Remove(vk);
+            // Enter/Esc beenden das Verschieben, auch wenn gerade das Spiel im Vordergrund ist
+            if (KeysPlacing && (vk == (int)Keys.Return || vk == (int)Keys.Escape))
+            {
+                swallowedKeys.Add(vk);
+                EndKeysPlacing();
+                return true;
+            }
 
             if (recording)
             {
@@ -2095,7 +3248,14 @@ namespace PurpleClicker
                 swallowedKeys.Add(vk);
                 if (vk != (int)Keys.Escape) AssignKey(false, vk);
                 else if (capTarget == 1) mulKey = new Hotkey(false, 0);   // Esc entfernt den Multiplikator-Hotkey
+                else if (capTarget == 2) { keysKey = new Hotkey(false, 0); SaveSettings(); }   // bzw. den der Tastenanzeige
                 Invalidate();
+                return true;
+            }
+            // Tastenanzeige an/aus: unabhaengig vom Programm-Filter des Autoclickers
+            if (keysKey.Code != 0 && !keysKey.IsMouse && keysKey.Code == vk)
+            {
+                if (swallowedKeys.Add(vk)) ToggleKeysByHotkey();   // Auto-Repeat nur schlucken
                 return true;
             }
             if (!active) return false;
@@ -2113,10 +3273,12 @@ namespace PurpleClicker
         }
 
         // ---------------------------------------------------------- Vordergrund-Erkennung
-        // Nur noetig fuer "Nur in Programmen" und das Zeitlimit der Tasten-Aufnahme
+        // Nur noetig fuer "Nur in Programmen", das Zeitlimit der Tasten-Aufnahme und die Tastenanzeige
+        // (Programm-Positionen, Anzeige nur in Programmen)
         void UpdateFgTimer()
         {
-            fgTimer.Enabled = servicesStarted && !exiting && (filterOn || recording);
+            fgTimer.Enabled = servicesStarted && !exiting &&
+                (filterOn || recording || (keysOn && (!keysGlobal || keysPrograms.Count > 0)));
         }
 
         void ForegroundTick()
@@ -2130,6 +3292,15 @@ namespace PurpleClicker
             if (exe != null)
                 foreach (string p in programs)
                     if (p == exe) { match = true; break; }
+
+            // Tastenanzeige: Programm im Vordergrund merken (eigenes Fenster aendert nichts, sonst springt die Position)
+            if (!own)
+            {
+                string kp = null;
+                if (exe != null) foreach (string p in keysPrograms) if (p == exe) { kp = p; break; }
+                keysFgProg = kp;
+            }
+            KeysApply();
 
             if (recording && Environment.TickCount - recStart > 90000) { EndRecording(false); rmNote = "Zeit abgelaufen"; }
             bool newActive = !filterOn || own || match;
@@ -2372,7 +3543,8 @@ namespace PurpleClicker
         }
 
         // Laufende Programme mit sichtbarem Fenster
-        List<ProcItem> BuildProcList()
+        // Laufende Programme mit Fenster, ohne die schon gewaehlten (exclude)
+        List<ProcItem> BuildProcList(List<string> exclude)
         {
             List<ProcItem> list = new List<ProcItem>();
             HashSet<string> seen = new HashSet<string>();
@@ -2389,7 +3561,7 @@ namespace PurpleClicker
                 uint pid;
                 string exe = Native.ExeOfWindow(h, out pid);
                 if (exe == null || pid == ownPid) return true;
-                if (programs.Contains(exe) || !seen.Add(exe)) return true;
+                if (exclude.Contains(exe) || !seen.Add(exe)) return true;
                 StringBuilder sb = new StringBuilder(len + 1);
                 Native.GetWindowText(h, sb, sb.Capacity);
                 list.Add(new ProcItem(exe, sb.ToString()));
@@ -2682,15 +3854,19 @@ namespace PurpleClicker
                 }
                 return Hit.ThemeOutside;
             }
-            if (page == 0 && !popupOpen && R_AutoHit.Contains(p)) return Hit.AutoSw;
+            LayoutTitle();
+            if (R_SettingsBtn.Contains(p)) return Hit.SettingsBtn;
             if (R_MouseBtn.Contains(p)) return Hit.MouseBtn;
             if (R_BattBtn.Contains(p)) return Hit.BattBtn;
             if (R_ArtyBtn.Contains(p)) return Hit.ArtyBtn;
+            if (R_KeysBtn.Contains(p)) return Hit.KeysBtn;
             if (linkDocRect.Contains(p)) return Hit.LinkDoc;
             if (linkRepoRect.Contains(p)) return Hit.LinkRepo;
             if (R_Title.Contains(p)) return Hit.Drag;
             if (page == 1) return HitRemap(p);
             if (page == 3) return HitArty(p);
+            if (page == 4) return HitKeys(p);
+            if (page == 5) return HitSettings(p);
             if (page == 2)
             {
                 if (R_BtDropSw.Contains(p)) return Hit.BtDropSw;
@@ -2700,16 +3876,7 @@ namespace PurpleClicker
                 return Hit.None;
             }
 
-            if (popupOpen)
-            {
-                if (R_PopList.Contains(p))
-                {
-                    int i = popScroll + (p.Y - R_PopList.Y) / POP_ROW;
-                    if (i < popItems.Count) { hitIndex = i; return Hit.PopItem; }
-                    return Hit.PopPanel;
-                }
-                return R_Pop.Contains(p) ? Hit.PopPanel : Hit.PopOutside;
-            }
+            if (popupOpen) return HitPopup(p);
 
             if (R_Minus.Contains(p)) return Hit.Minus;
             if (R_Plus.Contains(p)) return Hit.Plus;
@@ -2737,6 +3904,38 @@ namespace PurpleClicker
             if (addRect.Contains(p) && programs.Count < MAX_PROGRAMS) return Hit.ChipAdd;
             if (R_Start.Contains(p)) return Hit.Start;
             return Hit.None;
+        }
+
+        static Rectangle StBarSwRect(int f) { return new Rectangle(620, ST_ROW_Y0 + f * ST_ROW + 3, 44, 24); }
+
+        Hit HitSettings(Point p)
+        {
+            if (popupOpen) return HitPopup(p);
+            Rectangle auto = R_StAutoSw;
+            auto.Inflate(8, 4);
+            if (auto.Contains(p)) return Hit.AutoSw;
+            for (int f = 0; f < BarCount; f++)
+            {
+                Rectangle sw = StBarSwRect(f);
+                sw.Inflate(8, 4);
+                if (sw.Contains(p)) { hitIndex = f; return Hit.StBarSw; }
+                for (int i = 0; i < stChipRects[f].Count; i++)
+                    if (stChipRects[f][i].Contains(p) && p.X >= stChipRects[f][i].Right - 24) { hitIndex = f * 16 + i; return Hit.StProcX; }
+                if (stAddRects[f].Contains(p)) { hitIndex = f; return Hit.StProcAdd; }
+            }
+            return Hit.None;
+        }
+
+        // Programm-Auswahl (Hauptseite, Tastenanzeige, Einstellungen)
+        Hit HitPopup(Point p)
+        {
+            if (R_PopList.Contains(p))
+            {
+                int i = popScroll + (p.Y - R_PopList.Y) / POP_ROW;
+                if (i < popItems.Count) { hitIndex = i; return Hit.PopItem; }
+                return Hit.PopPanel;
+            }
+            return R_Pop.Contains(p) ? Hit.PopPanel : Hit.PopOutside;
         }
 
         string SeenString()
@@ -2793,6 +3992,50 @@ namespace PurpleClicker
             }
             else t = "Ansicht: " + (mouseView == 1 ? "Foto" : mouseView == 2 ? "gezeichnet, 5 Tasten" : "gezeichnet, 3 Tasten");
             return t;
+        }
+
+        // Zelle (Name + Schalter) des Tasten-Schalters i
+        static Rectangle KsKeyCell(int i)
+        {
+            int col = KsKeyCol[i], row = 0;
+            for (int j = 0; j < i; j++) if (KsKeyCol[j] == col) row++;
+            return new Rectangle(KsColX[col], KS_KEY_Y0 + row * KS_KEY_ROW, KsColW[col], KS_KEY_ROW - 1);
+        }
+
+        Hit HitKeys(Point p)
+        {
+            if (popupOpen) return HitPopup(p);
+            if (R_KsSw.Contains(p)) return Hit.KsSw;
+            if (R_KsHot.Contains(p)) return Hit.KsHot;
+            if (R_KsPrevBtn.Contains(p)) return Hit.KsPreview;
+            if (R_KsGlobalHit.Contains(p)) return Hit.KsGlobal;
+            for (int i = 0; i < ksChipRects.Count; i++)
+            {
+                Rectangle c = ksChipRects[i];
+                if (!c.Contains(p)) continue;
+                hitIndex = i;
+                return i > 0 && p.X >= c.Right - 24 ? Hit.KsProgX : Hit.KsProg;
+            }
+            if (ksAddRect.Contains(p)) return Hit.KsProgAdd;
+            if (R_KsScreen.Contains(p))
+            {
+                hitIndex = (p.X >= R_KsScreen.X + R_KsScreen.Width / 2 ? 1 : 0) + (p.Y >= R_KsScreen.Y + R_KsScreen.Height / 2 ? 2 : 0);
+                return Hit.KsCorner;
+            }
+            if (R_KsMove.Contains(p)) return Hit.KsMove;
+            if (R_KsPrev.Contains(p))
+            {
+                hitIndex = KsCapAt(p, out ksHitEdge);
+                return hitIndex >= 0 ? Hit.KsCap : Hit.None;
+            }
+            if (R_KsReset.Contains(p)) return Hit.KsReset;
+            if (R_KsSnapHit.Contains(p)) return Hit.KsSnap;
+            for (int i = 0; i < KsKeyCol.Length; i++)
+                if (KsKeyCell(i).Contains(p)) { hitIndex = i; return Hit.KsKey; }
+            Hit[] sl = { Hit.KsScale, Hit.KsOpacity, Hit.KsMargin };
+            for (int i = 0; i < sl.Length; i++)
+                if (new Rectangle(KS_COL_X, KsRowY[i] + 22, 664 - KS_COL_X, 24).Contains(p)) return sl[i];
+            return Hit.None;
         }
 
         Hit HitRemap(Point p)
@@ -2883,7 +4126,7 @@ namespace PurpleClicker
             Hit h = HitTest(p);
             int idx = hitIndex;
 
-            if (capturing && h != (capTarget == 0 ? Hit.HotChange : Hit.MulKey)) { capturing = false; Invalidate(); }
+            if (capturing && h != (capTarget == 0 ? Hit.HotChange : capTarget == 1 ? Hit.MulKey : Hit.KsHot)) { capturing = false; Invalidate(); }
             if (editing && h != Hit.Number) CommitEdit();
             if (arFocus >= 0 && h != ArFieldHit(arFocus) && !(arFocus == 2 && h == Hit.ArTabAdd)) ArBlur();
 
@@ -2902,6 +4145,7 @@ namespace PurpleClicker
                         ApplyTheme(theme);
                         BuildFonts();
                         rainbowTimer.Enabled = theme == THEME_RAINBOW;
+                        if (keysOverlay != null && !keysOverlay.IsDisposed) KeysLook(keysOverlay);
                         SaveSettings();
                     }
                     break;
@@ -2929,6 +4173,105 @@ namespace PurpleClicker
                     themeOpen = false;
                     arTabOpen = false;
                     break;
+                case Hit.KeysBtn:
+                    EndRecording(false);
+                    page = page == 4 ? 0 : 4;
+                    popupOpen = false;
+                    themeOpen = false;
+                    break;
+                case Hit.SettingsBtn:
+                    EndRecording(false);
+                    page = page == 5 ? 0 : 5;
+                    popupOpen = false;
+                    themeOpen = false;
+                    break;
+                case Hit.StBarSw:
+                    if (idx >= 0 && idx < BarCount) { barShow[idx] = !barShow[idx]; BarApply(barRunning); SaveSettings(); }
+                    break;
+                case Hit.StProcX:
+                    if (idx >= 0 && idx / 16 < BarCount && idx % 16 < barProcs[idx / 16].Count)
+                    {
+                        barProcs[idx / 16].RemoveAt(idx % 16);
+                        BarCheck();
+                        SaveSettings();
+                    }
+                    break;
+                case Hit.StProcAdd:
+                    if (idx >= 0 && idx < BarCount)
+                    {
+                        popItems = BuildProcList(barProcs[idx]);
+                        popScroll = 0;
+                        popTarget = 10 + idx;
+                        popupOpen = true;
+                    }
+                    break;
+                case Hit.KsSw: SetKeysOn(!keysOn); break;
+                case Hit.KsCorner:
+                    if (idx >= 0 && idx <= 3) { PlaceOf(keysEdit).Corner = idx; KeysChanged(true); SaveSettings(); }
+                    break;
+                case Hit.KsHot: capTarget = 2; capturing = !capturing; break;
+                case Hit.KsGlobal:
+                    keysGlobal = !keysGlobal;
+                    UpdateFgTimer();
+                    ForegroundTick();
+                    SaveSettings();
+                    break;
+                case Hit.KsProg:
+                    // Chip waehlt, wessen Position eingestellt wird (0 = Standard)
+                    keysEdit = idx >= 1 && idx <= keysPrograms.Count ? keysPrograms[idx - 1] : null;
+                    KeysChanged(true);
+                    break;
+                case Hit.KsProgX:
+                    if (idx >= 1 && idx <= keysPrograms.Count)
+                    {
+                        string ex = keysPrograms[idx - 1];
+                        keysPrograms.RemoveAt(idx - 1);
+                        keysPlaces.Remove(ex);
+                        if (keysEdit == ex) keysEdit = null;
+                        if (keysFgProg == ex) keysFgProg = null;
+                        UpdateFgTimer();
+                        KeysApply();
+                        SaveSettings();
+                    }
+                    break;
+                case Hit.KsProgAdd:
+                    popItems = BuildProcList(keysPrograms);
+                    popScroll = 0;
+                    popTarget = 1;
+                    popupOpen = true;
+                    break;
+                case Hit.KsMove: ToggleKeysPlacing(); break;
+                case Hit.KsCap:
+                    if (idx >= 0)
+                    {
+                        dragKind = 7;
+                        ksDragCap = idx;
+                        ksDragEdge = ksHitEdge;
+                        ksDragStart = keysPos[idx];
+                        ksDragP0 = p;
+                    }
+                    break;
+                case Hit.KsSnap: keysSnap = !keysSnap; SaveSettings(); break;
+                case Hit.KsReset:
+                    keysPos = KeyOverlayForm.DefaultLayout();
+                    KeysChanged(true);
+                    SaveSettings();
+                    break;
+                case Hit.KsKey:
+                    if (idx >= 0 && idx < keysShow.Length)
+                    {
+                        keysShow[idx] = !keysShow[idx];
+                        KeysChanged(true);
+                        SaveSettings();
+                    }
+                    break;
+                case Hit.KsScale:
+                case Hit.KsOpacity:
+                case Hit.KsMargin:
+                    dragKind = h == Hit.KsScale ? 4 : h == Hit.KsOpacity ? 5 : 6;
+                    KsSliderTo(dragKind, p.X);
+                    break;
+                case Hit.KsPreview: KeysPreview(); break;
                 case Hit.ArPos: ArFocus(0); break;
                 case Hit.ArTgt: ArFocus(1); break;
                 case Hit.ArTabField: ArFocus(2); break;
@@ -3032,12 +4375,39 @@ namespace PurpleClicker
                     ForegroundTick();
                     break;
                 case Hit.ChipAdd:
-                    popItems = BuildProcList();
+                    popItems = BuildProcList(programs);
                     popScroll = 0;
+                    popTarget = 0;
                     popupOpen = true;
                     break;
                 case Hit.PopItem:
-                    if (idx >= 0 && idx < popItems.Count && programs.Count < MAX_PROGRAMS)
+                    if (popTarget >= 10)
+                    {
+                        int bf = popTarget - 10;
+                        if (idx >= 0 && idx < popItems.Count && barProcs[bf].Count < MAX_BAR_PROCS)
+                        {
+                            barProcs[bf].Add(popItems[idx].Exe);
+                            popupOpen = false;
+                            BarCheck();
+                            SaveSettings();
+                        }
+                    }
+                    else if (popTarget == 1)
+                    {
+                        // neues Programm startet mit der Standard-Position und ist gleich zum Einstellen gewaehlt
+                        if (idx >= 0 && idx < popItems.Count && keysPrograms.Count < MAX_KEYS_PROGRAMS)
+                        {
+                            string ex = popItems[idx].Exe;
+                            keysPrograms.Add(ex);
+                            keysPlaces[ex] = keysStd.Copy();
+                            keysEdit = ex;
+                            popupOpen = false;
+                            UpdateFgTimer();
+                            ForegroundTick();
+                            SaveSettings();
+                        }
+                    }
+                    else if (idx >= 0 && idx < popItems.Count && programs.Count < MAX_PROGRAMS)
                     {
                         programs.Add(popItems[idx].Exe);
                         filterOn = true; // Auswahl aktiviert den Filter
@@ -3049,6 +4419,8 @@ namespace PurpleClicker
                     break;
                 case Hit.PopOutside: popupOpen = false; arTabOpen = false; break;
             }
+            if (page != 4 || h == Hit.Min) EndKeysPlacing();
+            KeysApply();   // Seitenwechsel: ohne "Ueberall" ist die Anzeige auf ihrer eigenen Seite sichtbar
             hover = HitTest(p);
             hoverIdx = hitIndex;
             Invalidate();
@@ -3061,16 +4433,21 @@ namespace PurpleClicker
             if (dragKind == 1) SliderTo(p.X);
             else if (dragKind == 2) MulTo(p.X);
             else if (dragKind == 3) DurTo(p.X);
+            else if (dragKind == 7) KsCapTo(p);
+            else if (dragKind >= 4) KsSliderTo(dragKind, p.X);
             Hit h = HitTest(p);
             int idx = hitIndex;
-            if (h != hover || idx != hoverIdx)
+            int edge = h == Hit.KsCap ? ksHitEdge : 0;
+            if (h != hover || idx != hoverIdx || edge != ksHoverEdge)
             {
                 hover = h;
                 hoverIdx = idx;
+                ksHoverEdge = edge;
                 bool hand = h != Hit.None && h != Hit.Drag && h != Hit.PopPanel && h != Hit.PopOutside
                     && h != Hit.ThemePanel && h != Hit.ThemeOutside;
                 bool text = h == Hit.ArPos || h == Hit.ArTgt || h == Hit.ArTabField;
-                Cursor = text ? Cursors.IBeam : hand ? Cursors.Hand : Cursors.Default;
+                Cursor = text ? Cursors.IBeam : dragKind == 7 ? KsCursor(ksDragEdge) : h == Hit.KsCap ? KsCursor(edge)
+                    : hand ? Cursors.Hand : Cursors.Default;
                 Invalidate();
             }
         }
@@ -3078,10 +4455,12 @@ namespace PurpleClicker
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);
-            bool wasDur = dragKind == 3;
+            bool wasDur = dragKind == 3, wasKeys = dragKind >= 4;
             dragKind = 0;
+            if (ksDragCap >= 0) { ksDragCap = -1; ksGuideX.Clear(); ksGuideY.Clear(); Invalidate(); }
             repeatTimer.Stop();
             if (wasDur) ShowPreview(); // Vorschau mit der eingestellten Dauer
+            if (wasKeys) SaveSettings();
         }
 
         protected override void OnMouseLeave(EventArgs e)
@@ -3148,7 +4527,7 @@ namespace PurpleClicker
                 e.Handled = true;
                 return;
             }
-            if ((page == 1 || page == 2) && !themeOpen && e.KeyCode == Keys.Escape)
+            if ((page == 1 || page == 2 || ((page == 4 || page == 5) && !popupOpen)) && !themeOpen && e.KeyCode == Keys.Escape)
             {
                 page = 0;
                 Invalidate();
@@ -3190,7 +4569,7 @@ namespace PurpleClicker
         }
 
         // ---------------------------------------------------------- Zeichnen
-        static GraphicsPath RR(RectangleF r, float rad)
+        internal static GraphicsPath RR(RectangleF r, float rad)
         {
             float d = rad * 2;
             if (d > r.Height) d = r.Height;
@@ -3204,7 +4583,7 @@ namespace PurpleClicker
             return p;
         }
 
-        static void FillRR(Graphics g, Color c, Rectangle r, float rad)
+        internal static void FillRR(Graphics g, Color c, Rectangle r, float rad)
         {
             using (GraphicsPath p = RR(r, rad))
             using (SolidBrush b = new SolidBrush(c))
@@ -3330,7 +4709,7 @@ namespace PurpleClicker
             }
         }
 
-        static void StrokeRR(Graphics g, Color c, Rectangle r, float rad, float w)
+        internal static void StrokeRR(Graphics g, Color c, Rectangle r, float rad, float w)
         {
             RectangleF rf = new RectangleF(r.X + 0.5f, r.Y + 0.5f, r.Width - 1f, r.Height - 1f);
             using (GraphicsPath p = RR(rf, rad))
@@ -3338,7 +4717,7 @@ namespace PurpleClicker
                 g.DrawPath(pen, p);
         }
 
-        static void DrawText(Graphics g, string s, Font f, Color c, Rectangle r, StringAlignment h)
+        internal static void DrawText(Graphics g, string s, Font f, Color c, Rectangle r, StringAlignment h)
         {
             using (StringFormat sf = new StringFormat())
             using (SolidBrush b = new SolidBrush(c))
@@ -3521,14 +4900,19 @@ namespace PurpleClicker
                 g.DrawLine(pen, R_Close.X + 20, R_Close.Y + 10, R_Close.X + 10, R_Close.Y + 20);
             }
 
-            DrawGear(g, hover == Hit.Gear || themeOpen);
-            DrawMouseIcon(g, hover == Hit.MouseBtn);
-            DrawBattIcon(g, hover == Hit.BattBtn);
-            DrawArtyIcon(g, hover == Hit.ArtyBtn);
+            LayoutTitle();
+            DrawFeatIcon(g, BAR_THEME, R_Gear, hover == Hit.Gear, themeOpen);
+            DrawSettingsIcon(g, hover == Hit.SettingsBtn);
+            DrawFeatIcon(g, 0, R_KeysBtn, hover == Hit.KeysBtn, page == 4);
+            DrawFeatIcon(g, 1, R_ArtyBtn, hover == Hit.ArtyBtn, page == 3);
+            DrawFeatIcon(g, 2, R_BattBtn, hover == Hit.BattBtn, page == 2);
+            DrawFeatIcon(g, 3, R_MouseBtn, hover == Hit.MouseBtn, page == 1);
             if (page != 0)
             {
                 if (page == 1) DrawRemapPage(g);
                 else if (page == 2) DrawBatteryPage(g);
+                else if (page == 4) DrawKeysPage(g);
+                else if (page == 5) DrawSettingsPage(g);
                 else
                 {
                     DrawArtyPage(g);
@@ -3585,10 +4969,6 @@ namespace PurpleClicker
             FillRR(g, hover == Hit.HotChange ? C_BtnHover : C_Btn, R_HotBtn, RadCtl(R_HotBtn.Height));
             DrawText(g, capMain ? "Abbruch" : "Ändern", fBtn, C_Text, R_HotBtn, StringAlignment.Center);
 
-            // Autostart (Titelleiste): mit Windows starten
-            DrawText(g, "Autostart", fChip, autostart ? C_Text : C_Dim,
-                new Rectangle(R_AutoHit.X, R_AutoHit.Y, R_AutoSw.X - R_AutoHit.X - 8, R_AutoHit.Height), StringAlignment.Far);
-            Switch(g, R_AutoSw, autostart, hover == Hit.AutoSw);
 
             // Multiplikator: 1 echter Klick = N Klicks
             CardInline(g, R_CardMul, "MULTIPLIKATOR");
@@ -3666,10 +5046,10 @@ namespace PurpleClicker
 
 
         // Farbwechsel-Symbol oben rechts (Theme-Auswahl): Farbrad aus sechs Segmenten
-        void DrawGear(Graphics g, bool hot)
+        void DrawThemeIcon(Graphics g, Rectangle r, bool hot)
         {
-            BtnShape(g, hot ? C_BtnHover : C_Btn, R_Gear);
-            float cx = R_Gear.X + R_Gear.Width / 2f, cy = R_Gear.Y + R_Gear.Height / 2f;
+            BtnShape(g, hot ? C_BtnHover : C_Btn, r);
+            float cx = r.X + r.Width / 2f, cy = r.Y + r.Height / 2f;
             Color[] wheel = {
                 Color.FromArgb(255, 94, 160), Color.FromArgb(255, 166, 77), Color.FromArgb(57, 255, 120),
                 Color.FromArgb(0, 229, 255), Color.FromArgb(124, 108, 255), Color.FromArgb(255, 43, 214) };
@@ -3681,12 +5061,42 @@ namespace PurpleClicker
                 g.FillEllipse(b, cx - 3.6f, cy - 3.6f, 7.2f, 7.2f);
         }
 
-        // Maus-Symbol in der Titelleiste (oeffnet die Umbelegung)
-        void DrawMouseIcon(Graphics g, bool hot)
+        // Symbole der Funktionen (Titelleiste und Einstellungsseite): f wie BarNames, sel = Seite offen bzw. hervorgehoben
+        void DrawFeatIcon(Graphics g, int f, Rectangle r, bool hot, bool sel)
         {
-            BtnShape(g, hot || page == 1 ? C_BtnHover : C_Btn, R_MouseBtn);
-            float cx = R_MouseBtn.X + R_MouseBtn.Width / 2f, cy = R_MouseBtn.Y + R_MouseBtn.Height / 2f;
-            Color c = page == 1 ? C_Accent : C_Text;
+            if (r.IsEmpty) return;
+            if (f == 0) DrawKeysIcon(g, r, hot, sel);
+            else if (f == 1) DrawArtyIcon(g, r, hot, sel);
+            else if (f == 2) DrawBattIcon(g, r, hot, sel);
+            else if (f == 3) DrawMouseIcon(g, r, hot, sel);
+            else DrawThemeIcon(g, r, hot || sel);
+        }
+
+        // Einstellungen (ganz rechts): Zahnrad mit acht Zaehnen
+        void DrawSettingsIcon(Graphics g, bool hot)
+        {
+            Rectangle r = R_SettingsBtn;
+            bool sel = page == 5;
+            BtnShape(g, hot || sel ? C_BtnHover : C_Btn, r);
+            float cx = r.X + r.Width / 2f, cy = r.Y + r.Height / 2f;
+            PointF[] pts = new PointF[32];
+            for (int i = 0; i < 32; i++)
+            {
+                // je Zahn: zwei Punkte aussen, zwei innen
+                double a = (i / 4 + ((i % 4) == 0 ? -0.18 : (i % 4) == 1 ? 0.18 : (i % 4) == 2 ? 0.32 : 0.68)) * Math.PI / 4;
+                float rad = (i % 4) < 2 ? 9.2f : 6.6f;
+                pts[i] = new PointF(cx + (float)Math.Cos(a) * rad, cy + (float)Math.Sin(a) * rad);
+            }
+            using (SolidBrush b = new SolidBrush(sel ? C_Accent : C_Text)) g.FillPolygon(b, pts);
+            using (SolidBrush b = new SolidBrush(hot || sel ? C_BtnHover : C_Btn)) g.FillEllipse(b, cx - 3f, cy - 3f, 6f, 6f);
+        }
+
+        // Maus-Symbol (oeffnet die Umbelegung)
+        void DrawMouseIcon(Graphics g, Rectangle r, bool hot, bool sel)
+        {
+            BtnShape(g, hot || sel ? C_BtnHover : C_Btn, r);
+            float cx = r.X + r.Width / 2f, cy = r.Y + r.Height / 2f;
+            Color c = sel ? C_Accent : C_Text;
             using (GraphicsPath p = RR(new RectangleF(cx - 6f, cy - 9f, 12f, 18f), 6f))
             using (Pen pen = new Pen(c, 1.6f))
             {
@@ -3696,12 +5106,12 @@ namespace PurpleClicker
             }
         }
 
-        // Akku-Symbol in der Titelleiste (oeffnet die Akku-Seite); Fuellstand = schwaechstes verbundenes Geraet
-        void DrawBattIcon(Graphics g, bool hot)
+        // Akku-Symbol (oeffnet die Akku-Seite); Fuellstand = schwaechstes verbundenes Geraet
+        void DrawBattIcon(Graphics g, Rectangle r, bool hot, bool sel)
         {
-            BtnShape(g, hot || page == 2 ? C_BtnHover : C_Btn, R_BattBtn);
-            float cx = R_BattBtn.X + R_BattBtn.Width / 2f, cy = R_BattBtn.Y + R_BattBtn.Height / 2f;
-            Color c = page == 2 ? C_Accent : C_Text;
+            BtnShape(g, hot || sel ? C_BtnHover : C_Btn, r);
+            float cx = r.X + r.Width / 2f, cy = r.Y + r.Height / 2f;
+            Color c = sel ? C_Accent : C_Text;
             int low = -1;
             foreach (BattDev d in Battery.Devices)
                 if (d.Online && (low < 0 || d.Last.Percent < low)) low = d.Last.Percent;
@@ -3716,12 +5126,12 @@ namespace PurpleClicker
             }
         }
 
-        // Fadenkreuz in der Titelleiste (oeffnet den Artillerie-Rechner)
-        void DrawArtyIcon(Graphics g, bool hot)
+        // Fadenkreuz (oeffnet den Artillerie-Rechner)
+        void DrawArtyIcon(Graphics g, Rectangle r, bool hot, bool sel)
         {
-            BtnShape(g, hot || page == 3 ? C_BtnHover : C_Btn, R_ArtyBtn);
-            float cx = R_ArtyBtn.X + R_ArtyBtn.Width / 2f, cy = R_ArtyBtn.Y + R_ArtyBtn.Height / 2f;
-            Color c = page == 3 ? C_Accent : C_Text;
+            BtnShape(g, hot || sel ? C_BtnHover : C_Btn, r);
+            float cx = r.X + r.Width / 2f, cy = r.Y + r.Height / 2f;
+            Color c = sel ? C_Accent : C_Text;
             using (Pen pen = new Pen(c, 1.6f))
             {
                 pen.StartCap = LineCap.Round;
@@ -3734,6 +5144,298 @@ namespace PurpleClicker
             }
             using (SolidBrush b = new SolidBrush(c))
                 g.FillEllipse(b, cx - 1.3f, cy - 1.3f, 2.6f, 2.6f);
+        }
+
+        // Tastatur-Symbol (oeffnet die Tastenanzeige); Punkt oben rechts, wenn sie an ist
+        void DrawKeysIcon(Graphics g, Rectangle r, bool hot, bool sel)
+        {
+            BtnShape(g, hot || sel ? C_BtnHover : C_Btn, r);
+            float cx = r.X + r.Width / 2f, cy = r.Y + r.Height / 2f;
+            Color c = sel ? C_Accent : C_Text;
+            using (GraphicsPath p = RR(new RectangleF(cx - 9.5f, cy - 6.5f, 19f, 13f), 2.5f))
+            using (Pen pen = new Pen(c, 1.5f))
+            {
+                pen.StartCap = LineCap.Round;
+                pen.EndCap = LineCap.Round;
+                g.DrawPath(pen, p);
+                g.DrawLine(pen, cx - 4.5f, cy + 3f, cx + 4.5f, cy + 3f);   // Leertaste
+            }
+            using (SolidBrush b = new SolidBrush(c))
+                for (int i = 0; i < 4; i++)
+                {
+                    g.FillRectangle(b, cx - 6.4f + i * 3.6f, cy - 3.6f, 1.8f, 1.8f);
+                    if (i < 3) g.FillRectangle(b, cx - 4.6f + i * 3.6f, cy - 0.6f, 1.8f, 1.8f);
+                }
+            if (keysOn)
+                using (SolidBrush b = new SolidBrush(C_Accent))
+                    g.FillEllipse(b, r.Right - 8, r.Y + 3, 5, 5);
+        }
+
+        // Einstellungen: Autostart; je Funktion Symbol in der Leiste an/aus und "nur wenn laeuft"
+        void DrawSettingsPage(Graphics g)
+        {
+            Card(g, R_StCard, "EINSTELLUNGEN");
+            DrawText(g, "Mit Windows starten", fBtn, C_Text, new Rectangle(40, R_StAutoSw.Y, 500, R_StAutoSw.Height), StringAlignment.Near);
+            Switch(g, R_StAutoSw, autostart, hover == Hit.AutoSw);
+            using (Pen sep = new Pen(C_CardLine, 1f))
+                g.DrawLine(sep, 36, 136, 664, 136);
+            DrawText(g, "LEISTE OBEN", fLabel, C_Dim, new Rectangle(36, 144, 300, 20), StringAlignment.Near);
+
+            for (int f = 0; f < BarCount; f++)
+            {
+                int y = ST_ROW_Y0 + f * ST_ROW;
+                bool on = barShow[f];
+                DrawFeatIcon(g, f, new Rectangle(36, y, 30, 30), false, on && BarVisible(f));
+                DrawText(g, BarNames[f], fBtn, on ? C_Text : C_Dim, new Rectangle(78, y, 500, 30), StringAlignment.Near);
+                Switch(g, StBarSwRect(f), on, hover == Hit.StBarSw && hoverIdx == f);
+
+                // Programme, von denen eines laufen muss (leer = immer)
+                int cy = y + ST_CHIP_DY;
+                DrawText(g, "Nur wenn läuft", fChip, C_Dim, new Rectangle(78, cy, ST_CHIP_X0 - 84, ST_CHIP_H), StringAlignment.Near);
+                stChipRects[f].Clear();
+                stAddRects[f] = Rectangle.Empty;
+                int x = ST_CHIP_X0;
+                float cr = RadCtl(ST_CHIP_H);
+                for (int i = 0; i < barProcs[f].Count; i++)
+                {
+                    string name = barProcs[f][i];
+                    float tw = g.MeasureString(name, fChip, 2000, StringFormat.GenericTypographic).Width;
+                    int w = (int)Math.Min(tw + 56, 180);
+                    if (x + w > ST_CHIP_X1) break;
+                    Rectangle r = new Rectangle(x, cy, w, ST_CHIP_H);
+                    stChipRects[f].Add(r);
+                    FillRR(g, C_Btn, r, cr);
+                    StrokeRR(g, barRunning[f] ? C_Accent : C_CardLine, r, cr, 1f);   // Rahmen in Akzentfarbe: gerade aktiv
+                    DrawText(g, name, fChip, on ? C_Text : C_Dim, new Rectangle(r.X + 12, r.Y, r.Width - 38, r.Height), StringAlignment.Near);
+                    bool xh = hover == Hit.StProcX && hoverIdx == f * 16 + i;
+                    Rectangle xr = new Rectangle(r.Right - 22, r.Y + 3, 18, 18);
+                    if (xh) using (SolidBrush b = new SolidBrush(Color.FromArgb(60, 60, 60))) g.FillEllipse(b, xr);
+                    using (Pen pen = new Pen(xh ? Color.White : C_Dim, 1.4f))
+                    {
+                        pen.StartCap = LineCap.Round;
+                        pen.EndCap = LineCap.Round;
+                        g.DrawLine(pen, xr.X + 6, xr.Y + 6, xr.X + 12, xr.Y + 12);
+                        g.DrawLine(pen, xr.X + 12, xr.Y + 6, xr.X + 6, xr.Y + 12);
+                    }
+                    x += w + 6;
+                }
+                if (barProcs[f].Count < MAX_BAR_PROCS && x + 30 <= ST_CHIP_X1)
+                {
+                    stAddRects[f] = new Rectangle(x, cy, 30, ST_CHIP_H);
+                    bool hot = hover == Hit.StProcAdd && hoverIdx == f;
+                    FillRR(g, hot ? A(36, C_Accent) : C_Field, stAddRects[f], cr);
+                    StrokeRR(g, C_Accent, stAddRects[f], cr, 1f);
+                    DrawText(g, "+", fBtn, C_Accent, stAddRects[f], StringAlignment.Center);
+                }
+                if (f < BarCount - 1)
+                    using (Pen sep = new Pen(A(120, C_CardLine), 1f))
+                        g.DrawLine(sep, 36, y + ST_ROW - 9, 664, y + ST_ROW - 9);
+            }
+            if (popupOpen) DrawPopup(g);
+        }
+
+        // Tastenanzeige-Seite: Schalter, Vorschau mit Beispielzustand, Tasten-Schalter, Ecke und Schieber
+        void DrawKeysPage(Graphics g)
+        {
+            Card(g, R_KsCard, "TASTENANZEIGE");
+            DrawText(g, "Tastenanzeige einblenden", fBtn, C_Text, new Rectangle(40, R_KsSw.Y, R_KsPrevBtn.X - 50, R_KsSw.Height), StringAlignment.Near);
+            Switch(g, R_KsSw, keysOn, hover == Hit.KsSw);
+            float pbr = RadCtl(R_KsPrevBtn.Height);
+            FillRR(g, hover == Hit.KsPreview ? C_BtnHover : C_Btn, R_KsPrevBtn, pbr);
+            DrawText(g, "Vorschau", fChip, C_Text, R_KsPrevBtn, StringAlignment.Center);
+            // Hotkey-Feld: Klick, dann Taste oder Maustaste druecken (Esc entfernt)
+            bool capKs = capturing && capTarget == 2;
+            float hr = RadCtl(R_KsHot.Height);
+            FillRR(g, C_Field, R_KsHot, hr);
+            StrokeRR(g, capKs ? C_Accent : hover == Hit.KsHot ? C_Dim : C_CardLine, R_KsHot, hr, capKs ? 1.5f : 1f);
+            if (capKs)
+                DrawText(g, "Taste drücken…", fChip, C_Accent, R_KsHot, StringAlignment.Center);
+            else
+            {
+                Rectangle inner = new Rectangle(R_KsHot.X + 12, R_KsHot.Y, R_KsHot.Width - 24, R_KsHot.Height);
+                DrawText(g, "Hotkey", fChip, C_Dim, inner, StringAlignment.Near);
+                DrawText(g, keysKey.Code == 0 ? "–" : keysKey.Short(), fChip, keysKey.Code == 0 ? C_Dim : C_Text, inner, StringAlignment.Far);
+            }
+            using (Pen sep = new Pen(C_CardLine, 1f))
+            {
+                g.DrawLine(sep, 36, 132, 664, 132);
+                g.DrawLine(sep, KS_COL_X - 16, 144, KS_COL_X - 16, 424);
+            }
+
+            // Vorschau auf angedeutetem Spielbild, mit eingestellter Deckkraft
+            float pr = Math.Min(RadCtl(R_KsPrev.Height), 10f);
+            using (GraphicsPath p = RR(R_KsPrev, pr))
+            {
+                using (LinearGradientBrush br = new LinearGradientBrush(R_KsPrev, Color.FromArgb(34, 46, 58), Color.FromArgb(58, 44, 34), LinearGradientMode.ForwardDiagonal))
+                    g.FillPath(br, p);
+                GraphicsState st = g.Save();
+                g.SetClip(p);
+                using (Pen hz = new Pen(Color.FromArgb(28, 255, 255, 255), 1f))
+                    for (int x = R_KsPrev.X - R_KsPrev.Height; x < R_KsPrev.Right; x += 14)
+                        g.DrawLine(hz, x, R_KsPrev.Bottom, x + R_KsPrev.Height, R_KsPrev.Y);
+                g.TranslateTransform(R_KsPrev.X, R_KsPrev.Y);
+                KeyOverlayForm ko = KeysOverlay();
+                ko.Draw(g, KeyOverlayForm.Demo(KeyOverlayForm.DefaultCaps, KeysDemo, 60000), 1f, keysOpacity / 100f, false);
+                // eingerastete X/Y-Achsen beim Anordnen
+                if (ksDragCap >= 0 && (ksGuideX.Count > 0 || ksGuideY.Count > 0))
+                    using (Pen gp = new Pen(A(220, C_Accent), 1f))
+                    {
+                        gp.DashStyle = DashStyle.Dash;
+                        foreach (float gx in ksGuideX) g.DrawLine(gp, gx, 0, gx, R_KsPrev.Height);
+                        foreach (float gy in ksGuideY) g.DrawLine(gp, 0, gy, R_KsPrev.Width, gy);
+                    }
+                // gegriffene bzw. ueberfahrene Taste markieren (Tasten lassen sich hier anordnen)
+                int mark = ksDragCap >= 0 ? ksDragCap : hover == Hit.KsCap ? hoverIdx : -1;
+                if (mark >= 0)
+                {
+                    RectangleF cr = ko.CapRect(mark);
+                    cr.Inflate(2f, 2f);
+                    using (GraphicsPath cp = RR(cr, Math.Min(RadCtl(cr.Height), 10f)))
+                    using (Pen pen = new Pen(C_Accent, ksDragCap >= 0 ? 2f : 1.4f))
+                        g.DrawPath(pen, cp);
+                    // Griffpunkte an den Ecken: am Rand ziehen aendert die Groesse
+                    using (SolidBrush hb = new SolidBrush(C_Accent))
+                        foreach (PointF hp in new PointF[] { new PointF(cr.X, cr.Y), new PointF(cr.Right, cr.Y),
+                                                             new PointF(cr.X, cr.Bottom), new PointF(cr.Right, cr.Bottom) })
+                            g.FillRectangle(hb, hp.X - 2.5f, hp.Y - 2.5f, 5f, 5f);
+                }
+                g.Restore(st);
+            }
+            StrokeRR(g, C_CardLine, R_KsPrev, pr, 1f);
+
+            Switch(g, R_KsSnapSw, keysSnap, hover == Hit.KsSnap);
+            DrawText(g, "Einrasten", fBtn, C_Text, new Rectangle(R_KsSnapSw.Right + 10, R_KsSnapSw.Y, 100, R_KsSnapSw.Height), StringAlignment.Near);
+            bool def = KsLayoutIsDefault();
+            float rr = RadCtl(R_KsReset.Height);
+            FillRR(g, hover == Hit.KsReset && !def ? C_BtnHover : C_Btn, R_KsReset, rr);
+            DrawText(g, "Zurücksetzen", fChip, def ? C_Dim : C_Text, R_KsReset, StringAlignment.Center);
+
+            // Welche Tasten angezeigt werden
+            for (int i = 0; i < KsKeyCol.Length; i++)
+            {
+                Rectangle cell = KsKeyCell(i);
+                bool on = keysShow[i], hot = hover == Hit.KsKey && hoverIdx == i;
+                Switch(g, new Rectangle(cell.X, cell.Y + (cell.Height - 16) / 2, 28, 16), on, hot);
+                DrawText(g, KsKeyNames[i], fChip, on || hot ? C_Text : C_Dim,
+                    new Rectangle(cell.X + 36, cell.Y, cell.Width - 40, cell.Height), StringAlignment.Near);
+            }
+
+            // Position: Mini-Bildschirm, jede Ecke anklickbar
+            // Position der im Chip unten gewaehlten Einstellung (Standard oder Programm)
+            KeysPlace kp = PlaceOf(keysEdit);
+            DrawText(g, "Position", fBtn, C_Text, new Rectangle(KS_COL_X, R_KsScreen.Y, 70, R_KsScreen.Height), StringAlignment.Near);
+            DrawText(g, keysEdit ?? "Standard", fChip, keysEdit != null ? C_Accent : C_Dim,
+                new Rectangle(KS_COL_X + 72, R_KsScreen.Y, R_KsScreen.X - KS_COL_X - 80, R_KsScreen.Height), StringAlignment.Near);
+            FillRR(g, C_Field, R_KsScreen, 4);
+            StrokeRR(g, hover == Hit.KsCorner ? C_Dim : C_CardLine, R_KsScreen, 4, 1f);
+            for (int i = 0; i < 4; i++)
+            {
+                bool sel = kp.Corner == i, hot = hover == Hit.KsCorner && hoverIdx == i;
+                Rectangle q = new Rectangle(i % 2 == 0 ? R_KsScreen.X + 5 : R_KsScreen.Right - 27,
+                                            i < 2 ? R_KsScreen.Y + 5 : R_KsScreen.Bottom - 17, 22, 12);
+                if (sel) FillAccent(g, q, 2.5f, hot);
+                else FillRR(g, hot ? C_BtnHover : C_Btn, q, 2.5f);
+            }
+            if (kp.Corner == 4)
+            {
+                // freie Position maßstäblich auf dem Hauptbildschirm (anderer Bildschirm: an den Rand gedrückt)
+                Rectangle pb = Screen.PrimaryScreen.Bounds;
+                double fx = Math.Min(Math.Max((kp.X - pb.Left) / (double)Math.Max(1, pb.Width - KeyOverlayForm.W * scale * keysScale / 100.0), 0), 1);
+                double fy = Math.Min(Math.Max((kp.Y - pb.Top) / (double)Math.Max(1, pb.Height - KeyOverlayForm.H * scale * keysScale / 100.0), 0), 1);
+                Rectangle q = new Rectangle(R_KsScreen.X + 5 + (int)Math.Round(fx * (R_KsScreen.Width - 32)),
+                                            R_KsScreen.Y + 5 + (int)Math.Round(fy * (R_KsScreen.Height - 22)), 22, 12);
+                FillAccent(g, q, 2.5f, false);
+            }
+
+            bool placing = KeysPlacing;
+            float mr = RadCtl(R_KsMove.Height);
+            if (placing)
+            {
+                FillRR(g, A(hover == Hit.KsMove ? 60 : 38, C_Accent), R_KsMove, mr);
+                StrokeRR(g, C_Accent, R_KsMove, mr, 1.5f);
+                DrawText(g, "Fertig", fBtn, C_Accent, R_KsMove, StringAlignment.Center);
+            }
+            else
+            {
+                FillRR(g, hover == Hit.KsMove ? C_BtnHover : C_Btn, R_KsMove, mr);
+                StrokeRR(g, C_CardLine, R_KsMove, mr, 1f);
+                DrawText(g, "Frei verschieben", fBtn, C_Text, R_KsMove, StringAlignment.Center);
+            }
+
+            string[] names = { "Größe", "Deckkraft", "Abstand zum Rand" };
+            string[] vals = { keysScale + " %", keysOpacity + " %", keysMargin + " px" };
+            double[] ts = { (keysScale - 60) / 140.0, (keysOpacity - 20) / 80.0, keysMargin / 200.0 };
+            for (int i = 0; i < 3; i++)
+            {
+                int y = KsRowY[i];
+                DrawText(g, names[i], fBtn, C_Text, new Rectangle(KS_COL_X, y, 200, 20), StringAlignment.Near);
+                DrawText(g, vals[i], fBtn, C_Accent, new Rectangle(584, y, 80, 20), StringAlignment.Far);
+                int sy = y + 34;
+                int tx = KS_SL_X + (int)Math.Round(ts[i] * KS_SL_W);
+                FillRR(g, Color.FromArgb(34, 34, 34), new Rectangle(KS_SL_X, sy - 3, KS_SL_W, 6), 3);
+                FillAccent(g, new Rectangle(KS_SL_X, sy - 3, Math.Max(tx - KS_SL_X, 6), 6), 3, false);
+                Thumb(g, Color.White, C_Accent, tx, sy, 16, 2f);
+            }
+
+            DrawKeysPrograms(g);
+            if (popupOpen) DrawPopup(g);
+        }
+
+        // Leiste unten: "Ueberall" und die Programme; der gewaehlte Chip bestimmt, wessen Position oben eingestellt wird
+        void DrawKeysPrograms(Graphics g)
+        {
+            FillCard(g, R_KsProgBar);
+            StrokeRR(g, C_CardLine, R_KsProgBar, radCard, 1f);
+            Switch(g, R_KsGlobalSw, keysGlobal, hover == Hit.KsGlobal);
+            DrawText(g, "Überall", fBtn, C_Text, new Rectangle(R_KsGlobalSw.Right + 10, R_KsGlobalSw.Y, 70, R_KsGlobalSw.Height), StringAlignment.Near);
+            using (Pen sep = new Pen(C_CardLine, 1f))
+                g.DrawLine(sep, KS_CHIP_X0 - 12, R_KsProgBar.Y + 9, KS_CHIP_X0 - 12, R_KsProgBar.Bottom - 9);
+
+            ksChipRects.Clear();
+            ksAddRect = Rectangle.Empty;
+            int x = KS_CHIP_X0;
+            const int addW = 30;
+            for (int i = 0; i <= keysPrograms.Count; i++)
+            {
+                string name = i == 0 ? "Standard" : keysPrograms[i - 1];
+                bool x1 = i > 0;   // Programme haben ein X zum Entfernen
+                float tw = g.MeasureString(name, fChip, 2000, StringFormat.GenericTypographic).Width;
+                int w = (int)Math.Min(tw + 34 + (x1 ? 22 : 0), 160);
+                bool more = i < keysPrograms.Count || keysPrograms.Count < MAX_KEYS_PROGRAMS;
+                if (x + w + (more ? addW + 6 : 0) > KS_CHIP_X1 && i > 0) break;   // passt nicht mehr: Rest ausblenden
+                Rectangle r = new Rectangle(x, KS_CHIP_Y, w, KS_CHIP_H);
+                ksChipRects.Add(r);
+                string prog = i == 0 ? null : keysPrograms[i - 1];
+                bool sel = keysEdit == prog, hot = hover == Hit.KsProg && hoverIdx == i;
+                float cr = RadCtl(KS_CHIP_H);
+                FillRR(g, sel ? A(hot ? 60 : 38, C_Accent) : hot ? C_BtnHover : C_Btn, r, cr);
+                StrokeRR(g, sel ? C_Accent : C_CardLine, r, cr, sel ? 1.5f : 1f);
+                bool dim = i == 0 && !keysGlobal;   // ohne "Ueberall" wird die Standard-Position nirgends benutzt
+                DrawText(g, name, fChip, sel ? C_Accent : dim ? C_Dim : C_Text,
+                    new Rectangle(r.X + 12, r.Y, r.Width - 16 - (x1 ? 22 : 0), r.Height), StringAlignment.Near);
+                if (x1)
+                {
+                    bool xh = hover == Hit.KsProgX && hoverIdx == i;
+                    Rectangle xr = new Rectangle(r.Right - 24, r.Y + 4, 18, 18);
+                    if (xh) using (SolidBrush b = new SolidBrush(Color.FromArgb(60, 60, 60))) g.FillEllipse(b, xr);
+                    using (Pen pen = new Pen(xh ? Color.White : C_Dim, 1.4f))
+                    {
+                        pen.StartCap = LineCap.Round;
+                        pen.EndCap = LineCap.Round;
+                        g.DrawLine(pen, xr.X + 6, xr.Y + 6, xr.X + 12, xr.Y + 12);
+                        g.DrawLine(pen, xr.X + 12, xr.Y + 6, xr.X + 6, xr.Y + 12);
+                    }
+                }
+                x += w + 6;
+            }
+            if (keysPrograms.Count < MAX_KEYS_PROGRAMS && x + addW <= KS_CHIP_X1)
+            {
+                ksAddRect = new Rectangle(x, KS_CHIP_Y, addW, KS_CHIP_H);
+                bool hot = hover == Hit.KsProgAdd;
+                FillRR(g, hot ? A(36, C_Accent) : C_Field, ksAddRect, RadCtl(KS_CHIP_H));
+                StrokeRR(g, C_Accent, ksAddRect, RadCtl(KS_CHIP_H), 1f);
+                DrawText(g, "+", fBtn, C_Accent, ksAddRect, StringAlignment.Center);
+            }
         }
 
         // Eingabefeld des Rechners: markierter Inhalt, Schreibmarke, Platzhalter
@@ -4320,6 +6022,55 @@ namespace PurpleClicker
                         case "BattDropMsg": battDropMsg = v != 0; break;
                         case "BattToastMsg": battToastMsg = v != 0; break;
                         case "BattBootMsg": battBootMsg = v != 0; break;
+                        case "KeysOn": keysOn = v != 0; break;
+                        case "KeysCorner": keysStd.Corner = v >= 0 && v <= 4 ? v : 1; break;
+                        case "KeysGlobal": keysGlobal = v != 0; break;
+                        case "BarKeys":
+                        case "BarArty":
+                        case "BarBatt":
+                        case "BarMouse":
+                        case "BarTheme":   // "1;prog.exe;prog2.exe": Symbol an/aus, dann "nur wenn laeuft"
+                        {
+                            int bf = Array.IndexOf(BarKeys, k);
+                            string[] f = raw.Split(';');
+                            barShow[bf] = f[0].Trim() != "0";
+                            barProcs[bf].Clear();
+                            for (int fi = 1; fi < f.Length; fi++)
+                            {
+                                string n = f[fi].Trim().ToLowerInvariant();
+                                if (n.Length > 0 && !barProcs[bf].Contains(n) && barProcs[bf].Count < MAX_BAR_PROCS) barProcs[bf].Add(n);
+                            }
+                            break;
+                        }
+                        case "KeysHotMouse": keysKey.IsMouse = v != 0; break;
+                        case "KeysHotCode": keysKey.Code = v; break;
+                        case "KeysPrograms":   // "exe ecke x y;exe ecke x y"
+                            keysPrograms.Clear();
+                            keysPlaces.Clear();
+                            foreach (string s in raw.Split(';'))
+                            {
+                                string[] f = s.Trim().Split(' ');
+                                int c, x, y;
+                                if (f.Length != 4 || f[0].Length == 0 || !int.TryParse(f[1], out c) || !int.TryParse(f[2], out x)
+                                    || !int.TryParse(f[3], out y) || keysPlaces.ContainsKey(f[0].ToLowerInvariant())
+                                    || keysPrograms.Count >= MAX_KEYS_PROGRAMS) continue;
+                                string ex = f[0].ToLowerInvariant();
+                                KeysPlace kp = new KeysPlace();
+                                kp.Corner = c >= 0 && c <= 4 ? c : 1;
+                                kp.X = x;
+                                kp.Y = y;
+                                keysPrograms.Add(ex);
+                                keysPlaces[ex] = kp;
+                            }
+                            break;
+                        case "KeysHide": keysShow = KeyOverlayForm.ShowFromHidden(KeyOverlayForm.DefaultCaps, raw); break;
+                        case "KeysLayout": keysPos = KeyOverlayForm.ParseLayout(raw); break;
+                        case "KeysSnap": keysSnap = v != 0; break;
+                        case "KeysX": keysStd.X = v; break;
+                        case "KeysY": keysStd.Y = v; break;
+                        case "KeysMargin": keysMargin = Math.Min(Math.Max(v, 0), 200); break;
+                        case "KeysScale": keysScale = Math.Min(Math.Max(v, 60), 200); break;
+                        case "KeysOpacity": keysOpacity = Math.Min(Math.Max(v, 20), 100); break;
                         case "Theme": theme = ThemeFromSetting(raw); break;
                         case "ArtyPos":
                         case "ArtyTarget":
@@ -4369,8 +6120,17 @@ namespace PurpleClicker
                 if ((mulKey.IsMouse && (mulKey.Code < 1 || mulKey.Code > 5)) || mulKey.Code < 0 ||
                     (mulKey.IsMouse == hotkey.IsMouse && mulKey.Code == hotkey.Code))
                     mulKey = new Hotkey(false, 0);
+                if ((keysKey.IsMouse && (keysKey.Code < 1 || keysKey.Code > 5)) || keysKey.Code < 0 ||
+                    (keysKey.IsMouse == hotkey.IsMouse && keysKey.Code == hotkey.Code) ||
+                    (mulKey.Code != 0 && keysKey.IsMouse == mulKey.IsMouse && keysKey.Code == mulKey.Code))
+                    keysKey = new Hotkey(false, 0);
             }
             catch { }
+        }
+
+        string BarLine(int f)
+        {
+            return (barShow[f] ? "1" : "0") + (barProcs[f].Count > 0 ? ";" + string.Join(";", barProcs[f].ToArray()) : "");
         }
 
         void SaveSettings()
@@ -4401,7 +6161,27 @@ namespace PurpleClicker
                     "BattDropMsg=" + (battDropMsg ? 1 : 0),
                     "BattToastMsg=" + (battToastMsg ? 1 : 0),
                     "BattBootMsg=" + (battBootMsg ? 1 : 0),
+                    "KeysOn=" + (keysOn ? 1 : 0),
+                    "KeysCorner=" + keysStd.Corner,
+                    "KeysGlobal=" + (keysGlobal ? 1 : 0),
+                    "KeysHotMouse=" + (keysKey.IsMouse ? 1 : 0),
+                    "KeysHotCode=" + keysKey.Code,
+                    "KeysPrograms=" + string.Join(";", keysPrograms.ConvertAll(delegate(string ex)
+                        { KeysPlace kp = PlaceOf(ex); return ex + " " + kp.Corner + " " + kp.X + " " + kp.Y; }).ToArray()),
+                    "KeysHide=" + KeyOverlayForm.HiddenIds(KeyOverlayForm.DefaultCaps, keysShow),
+                    "KeysLayout=" + KeyOverlayForm.LayoutString(keysPos),
+                    "KeysSnap=" + (keysSnap ? 1 : 0),
+                    "KeysX=" + keysStd.X,
+                    "KeysY=" + keysStd.Y,
+                    "KeysMargin=" + keysMargin,
+                    "KeysScale=" + keysScale,
+                    "KeysOpacity=" + keysOpacity,
                     "Theme=" + ThemeNames[theme],
+                    BarKeys[0] + "=" + BarLine(0),
+                    BarKeys[1] + "=" + BarLine(1),
+                    BarKeys[2] + "=" + BarLine(2),
+                    BarKeys[3] + "=" + BarLine(3),
+                    BarKeys[4] + "=" + BarLine(4),
                     "Programs=" + string.Join(";", programs.ToArray()),
                     "ArtyPos=" + (double.IsNaN(arX[0]) ? "" : Arty.Num4(arX[0]) + " " + Arty.Num4(arY[0])),
                     "ArtyTarget=" + (double.IsNaN(arX[1]) ? "" : Arty.Num4(arX[1]) + " " + Arty.Num4(arY[1])),
@@ -4504,6 +6284,37 @@ namespace PurpleClicker
                     try { lg = Icon.ExtractAssociatedIcon(Application.ExecutablePath).ToBitmap(); } catch { }
                     if (i + 2 < args.Length && args[i + 2] == "--battery") new OverlayForm(lg, sc).SnapshotBattery(args[i + 1]);
                     else new OverlayForm(lg, sc).Snapshot(args[i + 1]);
+                    return;
+                }
+                // --keys-snapshot <datei.png> [--keys W,A,LMB] [--hide MMB,RadHoch] [--layout "W 62 8;LMB 0 0"] [--theme N]
+                //                 [--scale 100] [--opacity 85] [--placing]
+                // Kein Hook, kein Tray, keine Registry
+                if (args[i] == "--keys-snapshot" && i + 1 < args.Length)
+                {
+                    Native.SetProcessDPIAware();
+                    float sc;
+                    using (Graphics g0 = Graphics.FromHwnd(IntPtr.Zero)) sc = g0.DpiX / 96f;
+                    string ids = "", hide = "", layout = "";
+                    int th = 0, ksc = 100, kop = 100;
+                    bool placing = false;
+                    for (int j = i + 2; j < args.Length; j++)
+                    {
+                        if (args[j] == "--placing") { placing = true; continue; }
+                        if (j + 1 >= args.Length) break;
+                        if (args[j] == "--keys") ids = args[++j];
+                        else if (args[j] == "--hide") hide = args[++j];
+                        else if (args[j] == "--layout") layout = args[++j];
+                        else if (args[j] == "--theme") int.TryParse(args[++j], out th);
+                        else if (args[j] == "--scale") int.TryParse(args[++j], out ksc);
+                        else if (args[j] == "--opacity") int.TryParse(args[++j], out kop);
+                    }
+                    MainForm.ApplyTheme(th);
+                    KeyOverlayForm kf = new KeyOverlayForm(new KeyMon(), sc, KeyOverlayForm.DefaultCaps);
+                    MainForm.KeysLook(kf);
+                    kf.Configure(Math.Min(Math.Max(ksc, 60), 200), Math.Min(Math.Max(kop, 20), 100), 1, 20, Point.Empty);
+                    kf.SetShown(KeyOverlayForm.ShowFromHidden(KeyOverlayForm.DefaultCaps, hide));
+                    kf.SetLayout(KeyOverlayForm.ParseLayout(layout));
+                    kf.Snapshot(args[i + 1], KeyOverlayForm.Demo(KeyOverlayForm.DefaultCaps, ids, 60000), placing);
                     return;
                 }
                 if (args[i] == "--tray") tray = true;
