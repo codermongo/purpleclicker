@@ -147,6 +147,10 @@ namespace PurpleClicker
         public static extern bool QueryFullProcessImageName(IntPtr hProcess, uint flags, StringBuilder sb, ref int size);
         [DllImport("user32.dll")]
         public static extern short GetAsyncKeyState(int vk);
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RECT { public int Left, Top, Right, Bottom; }
+        [DllImport("user32.dll")]
+        public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
 
         // Fenster mit Alpha je Pixel (Tastenanzeige)
         [StructLayout(LayoutKind.Sequential)]
@@ -780,7 +784,7 @@ namespace PurpleClicker
             new Cap("RadHoch",   "▲",         CapSrc.WheelUp,   0,    216,  74,  24, 20),
             new Cap("RadRunter", "▼",         CapSrc.WheelDown, 0,    216,  98,  24, 20) };
 
-        readonly Cap[] caps;
+        protected readonly Cap[] caps;
         readonly float dpi;
         readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
         KeyMon mon;
@@ -793,16 +797,17 @@ namespace PurpleClicker
         bool placing, dragging;
         KeyMon placeMon;           // Beispielzustand beim Verschieben, wenn die Anzeige aus ist
         Point dragOff;
-        readonly bool[] show;      // je Cap: anzeigen?
+        protected readonly bool[] show;   // je Cap: anzeigen?
         const float Pad = 8f;      // Rand um die sichtbaren Caps (logische Pixel)
 
         // Aussehen aus dem aktiven Theme
-        Color accent = Color.FromArgb(124, 108, 255), onAccent = Color.White;
-        string family = "Segoe UI Semibold";
-        FontStyle style = FontStyle.Regular;
-        float radius = 8f;
+        protected Color accent = Color.FromArgb(124, 108, 255), onAccent = Color.White;
+        protected string family = "Segoe UI Semibold";
+        protected FontStyle style = FontStyle.Regular;
+        protected float radius = 8f;
 
         int userScale = 100, opacity = 85, corner = 1, margin = 20;
+        protected int topEveryMs = 2000;   // so oft wieder ganz nach oben (Spiele mit TOPMOST schieben sich davor)
         Point free;                // Position bei corner == 4 (Bildschirmpixel, linke obere Ecke)
 
         // Live = vom Benutzer eingeschaltet; sonst nur fuer die Vorschau sichtbar
@@ -848,7 +853,7 @@ namespace PurpleClicker
         float PxScale { get { return dpi * userScale / 100f; } }
 
         // Flaeche der sichtbaren Caps plus Rand; das Fenster schrumpft darauf (Ecke sitzt buendig an den Tasten)
-        RectangleF Area()
+        protected RectangleF Area()
         {
             RectangleF a = RectangleF.Empty;
             bool any = false;
@@ -879,39 +884,45 @@ namespace PurpleClicker
             if (Visible && !dragging) { Place(); Render(); }
         }
 
-        public static RectangleF[] DefaultLayout()
+        public static RectangleF[] DefaultLayout() { return DefaultLayout(DefaultCaps); }
+
+        public static RectangleF[] DefaultLayout(Cap[] defs)
         {
-            RectangleF[] r = new RectangleF[DefaultCaps.Length];
-            for (int i = 0; i < r.Length; i++) r[i] = DefaultCaps[i].R;
+            RectangleF[] r = new RectangleF[defs.Length];
+            for (int i = 0; i < r.Length; i++) r[i] = defs[i].R;
             return r;
         }
 
+        public static RectangleF[] ParseLayout(string raw) { return ParseLayout(DefaultCaps, raw); }
+
         // "Id x y w h;..." (ganze logische Pixel); ohne w h bleibt die Standardgroesse,
         // fehlende oder unbekannte Ids behalten die Vorgabe
-        public static RectangleF[] ParseLayout(string raw)
+        public static RectangleF[] ParseLayout(Cap[] defs, string raw)
         {
-            RectangleF[] r = DefaultLayout();
+            RectangleF[] r = DefaultLayout(defs);
             foreach (string s in raw.Split(';'))
             {
                 string[] f = s.Trim().Split(' ');
                 int x, y, w = 0, h = 0;
                 if ((f.Length != 3 && f.Length != 5) || !int.TryParse(f[1], out x) || !int.TryParse(f[2], out y)) continue;
                 if (f.Length == 5 && (!int.TryParse(f[3], out w) || !int.TryParse(f[4], out h))) continue;
-                for (int i = 0; i < DefaultCaps.Length; i++)
-                    if (string.Equals(DefaultCaps[i].Id, f[0], StringComparison.OrdinalIgnoreCase))
+                for (int i = 0; i < defs.Length; i++)
+                    if (string.Equals(defs[i].Id, f[0], StringComparison.OrdinalIgnoreCase))
                     {
-                        SizeF d = DefaultCaps[i].R.Size;
+                        SizeF d = defs[i].R.Size;
                         r[i] = ClampCap(new RectangleF(x, y, f.Length == 5 ? w : d.Width, f.Length == 5 ? h : d.Height));
                     }
             }
             return r;
         }
 
-        public static string LayoutString(RectangleF[] r)
+        public static string LayoutString(RectangleF[] r) { return LayoutString(DefaultCaps, r); }
+
+        public static string LayoutString(Cap[] defs, RectangleF[] r)
         {
             List<string> o = new List<string>();
-            for (int i = 0; i < DefaultCaps.Length && i < r.Length; i++)
-                o.Add(DefaultCaps[i].Id + " " + (int)Math.Round(r[i].X) + " " + (int)Math.Round(r[i].Y)
+            for (int i = 0; i < defs.Length && i < r.Length; i++)
+                o.Add(defs[i].Id + " " + (int)Math.Round(r[i].X) + " " + (int)Math.Round(r[i].Y)
                     + " " + (int)Math.Round(r[i].Width) + " " + (int)Math.Round(r[i].Height));
             return string.Join(";", o.ToArray());
         }
@@ -1104,7 +1115,7 @@ namespace PurpleClicker
             // Andere Fenster mit TOPMOST (z. B. ein Spiel im randlosen Modus) koennen sich davorschieben
             if (now - nextTop >= 0)
             {
-                nextTop = now + 2000;
+                nextTop = now + topEveryMs;
                 Native.SetWindowPos(Handle, (IntPtr)(-1), 0, 0, 0, 0, 0x1 | 0x2 | 0x10);
             }
             KeyMon m = ShownMon;
@@ -1163,7 +1174,7 @@ namespace PurpleClicker
 
         // Zeichnet die sichtbaren Caps; auch fuer die Vorschau auf der Einstellungsseite und den Snapshot.
         // alpha < 1 blendet alles ab (Deckkraft in der Seitenvorschau); crop = auf die Flaeche der sichtbaren Caps verschieben
-        public void Draw(Graphics g, KeyMon m, float sc, float alpha, bool crop)
+        public virtual void Draw(Graphics g, KeyMon m, float sc, float alpha, bool crop)
         {
             GraphicsState st = g.Save();
             g.SmoothingMode = SmoothingMode.AntiAlias;
@@ -1225,7 +1236,10 @@ namespace PurpleClicker
             g.Restore(st);
         }
 
-        static Color Fade(int a, Color c, float alpha) { return Color.FromArgb((int)(a * alpha), c.R, c.G, c.B); }
+        // Inhalt geaendert (FPS-Anzeige): beim naechsten Timer-Tick neu zeichnen
+        protected void Touch() { dirty = true; }
+
+        protected static Color Fade(int a, Color c, float alpha) { return Color.FromArgb((int)(a * alpha), c.R, c.G, c.B); }
 
         static Color Lighter(Color c)
         {
@@ -1292,6 +1306,853 @@ namespace PurpleClicker
         {
             if (disposing) timer.Dispose();
             base.Dispose(disposing);
+        }
+    }
+
+    // ------------------------------------------------------------------ FPS-Anzeige
+    // Bilder je Prozess ueber ETW mitlesen, wie PresentMon und die Xbox Game Bar: Present-Aufrufe von DXGI (DX10-12)
+    // und D3D9, fuer alles andere (Vulkan, OpenGL) der Present im Grafik-Kernel. Nichts wird ins Spiel geladen.
+    // Ohne Admin-Rechte, sofern der Benutzer in "Leistungsprotokollbenutzer" ist (richtet u. a. die Game Bar ein)
+    static class FpsEtw
+    {
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode)] static extern int StartTraceW(out ulong h, string name, IntPtr props);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode)] static extern int ControlTraceW(ulong h, string name, IntPtr props, uint code);
+        [DllImport("advapi32.dll")] static extern int EnableTraceEx2(ulong h, ref Guid prov, uint code, byte level, ulong any, ulong all, uint timeout, IntPtr param);
+        [DllImport("advapi32.dll", SetLastError = true)] static extern ulong OpenTraceW(IntPtr logfile);
+        [DllImport("advapi32.dll")] static extern int ProcessTrace(ulong[] h, uint n, IntPtr start, IntPtr end);
+        [DllImport("advapi32.dll")] static extern int CloseTrace(ulong h);
+        delegate void RecordCb(IntPtr rec);
+
+        const string Session = "PurpleClickerFps";
+        static Guid Dxgi = new Guid("CA11C036-0102-4A2D-A6AD-F03CFED5D3C9");
+        static Guid D3d9 = new Guid("783ACA0A-790E-4D7F-8451-AA850511C6B9");
+        static Guid DxgKrnl = new Guid("802EC45A-1E99-4B83-9920-87C98277BA9D");
+        public static readonly string[] SrcNames = { "DXGI", "D3D9", "Kernel" };
+        static readonly RecordCb cb = OnRecord;   // als Feld: der GC darf den Callback nicht einsammeln
+        static readonly object gate = new object();
+        static ulong trace;
+        static IntPtr logfile, loggerName;
+        static bool exitHooked;
+        public static bool Running;
+        public static int Error;   // Win32-Fehler beim Start (5 = kein Zugriff), 0 = keiner
+
+        // Zeitstempel (QPC) der letzten Bilder je Prozess, getrennt nach Quelle (0 DXGI, 1 D3D9, 2 Kernel)
+        class Frames
+        {
+            public readonly long[][] T = { new long[1024], new long[1024], new long[1024] };
+            public readonly int[] N = new int[3];
+            public long Last;
+        }
+        static readonly Dictionary<int, Frames> procs = new Dictionary<int, Frames>();
+
+        static IntPtr Zeroed(int size)
+        {
+            IntPtr p = Marshal.AllocHGlobal(size);
+            for (int i = 0; i < size; i++) Marshal.WriteByte(p, i, 0);
+            return p;
+        }
+
+        // EVENT_TRACE_PROPERTIES mit angehaengtem Sitzungsnamen
+        static IntPtr Props()
+        {
+            int size = 120 + (Session.Length + 1) * 2;
+            IntPtr p = Zeroed(size);
+            Marshal.WriteInt32(p, 0, size);        // Wnode.BufferSize
+            Marshal.WriteInt32(p, 40, 1);          // Wnode.ClientContext: Zeitstempel per QPC (wie Stopwatch)
+            Marshal.WriteInt32(p, 44, 0x20000);    // WNODE_FLAG_TRACED_GUID
+            Marshal.WriteInt32(p, 48, 16);         // BufferSize in KB
+            Marshal.WriteInt32(p, 64, 0x100 | 0x10);   // REAL_TIME_MODE | USE_MS_FLUSH_TIMER
+            Marshal.WriteInt32(p, 68, 200);        // FlushTimer: alle 200 ms ausliefern
+            Marshal.WriteInt32(p, 116, 120);       // LoggerNameOffset
+            return p;
+        }
+
+        static void StopSession()
+        {
+            IntPtr p = Props();
+            ControlTraceW(0, Session, p, 1);   // EVENT_TRACE_CONTROL_STOP
+            Marshal.FreeHGlobal(p);
+        }
+
+        // Provider nur mit den genannten Event-Ids einschalten (Filter im Kernel, sonst liefert DxgKrnl zehntausende pro Sekunde)
+        static int Enable(ulong session, Guid g, ulong keywords, ushort[] ids, bool needFilter)
+        {
+            int fsize = 4 + 2 * ids.Length;
+            IntPtr idf = Zeroed(fsize), fd = Zeroed(16), ep = Zeroed(48);
+            try
+            {
+                Marshal.WriteByte(idf, 0, 1);                       // EVENT_FILTER_EVENT_ID.FilterIn
+                Marshal.WriteInt16(idf, 2, (short)ids.Length);
+                for (int i = 0; i < ids.Length; i++) Marshal.WriteInt16(idf, 4 + 2 * i, (short)ids[i]);
+                Marshal.WriteInt64(fd, 0, idf.ToInt64());           // EVENT_FILTER_DESCRIPTOR
+                Marshal.WriteInt32(fd, 8, fsize);
+                Marshal.WriteInt32(fd, 12, unchecked((int)0x80000200));   // EVENT_FILTER_TYPE_EVENT_ID
+                Marshal.WriteInt32(ep, 0, 2);                       // ENABLE_TRACE_PARAMETERS_VERSION_2
+                Marshal.WriteIntPtr(ep, 32, fd);
+                Marshal.WriteInt32(ep, 40, 1);
+                int rc = EnableTraceEx2(session, ref g, 1, 4, keywords, 0, 0, ep);
+                if (rc != 0 && !needFilter) rc = EnableTraceEx2(session, ref g, 1, 4, keywords, 0, 0, IntPtr.Zero);
+                return rc;
+            }
+            finally { Marshal.FreeHGlobal(idf); Marshal.FreeHGlobal(fd); Marshal.FreeHGlobal(ep); }
+        }
+
+        public static void Start()
+        {
+            lock (gate)
+            {
+                if (Running) return;
+                Error = 0;
+                if (IntPtr.Size != 8) { Error = 50; return; }   // Strukturen unten nur fuer 64 Bit (ERROR_NOT_SUPPORTED)
+                StopSession();   // Sitzung eines abgestuerzten Laufs beenden (ueberlebt den Prozess)
+                IntPtr p = Props();
+                ulong session;
+                int rc = StartTraceW(out session, Session, p);
+                Marshal.FreeHGlobal(p);
+                if (rc != 0) { Error = rc; return; }
+                Enable(session, Dxgi, 0, new ushort[] { 42, 55 }, false);              // Present_Start, PresentMultiplaneOverlay_Start
+                Enable(session, D3d9, 0, new ushort[] { 1 }, false);                   // Present_Start
+                Enable(session, DxgKrnl, 0x8000000000000001UL, new ushort[] { 184 }, true);   // Present (Base | Performance)
+
+                // EVENT_TRACE_LOGFILEW (x64: 448 Byte): LoggerName, ProcessTraceMode, EventRecordCallback
+                // bleibt fuer die ganze Laufzeit stehen (OpenTrace schreibt hinein), bei jedem Start neu geleert
+                if (logfile == IntPtr.Zero) { logfile = Marshal.AllocHGlobal(448); loggerName = Marshal.StringToHGlobalUni(Session); }
+                for (int i = 0; i < 448; i++) Marshal.WriteByte(logfile, i, 0);
+                Marshal.WriteIntPtr(logfile, 8, loggerName);
+                Marshal.WriteInt32(logfile, 28, 0x100 | 0x10000000);   // ProcessTraceMode: REAL_TIME | EVENT_RECORD
+                Marshal.WriteIntPtr(logfile, 424, Marshal.GetFunctionPointerForDelegate(cb));
+                trace = OpenTraceW(logfile);
+                if (trace == ulong.MaxValue)
+                {
+                    Error = Marshal.GetLastWin32Error();
+                    if (Error == 0) Error = 1;
+                    StopSession();
+                    return;
+                }
+                ulong h = trace;
+                Thread t = new Thread(delegate() { try { ProcessTrace(new ulong[] { h }, 1, IntPtr.Zero, IntPtr.Zero); } catch { } });
+                t.IsBackground = true;
+                t.Name = "FpsEtw";
+                t.Start();
+                Running = true;
+                if (!exitHooked) { exitHooked = true; AppDomain.CurrentDomain.ProcessExit += delegate { Stop(); }; }
+            }
+        }
+
+        public static void Stop()
+        {
+            lock (gate)
+            {
+                if (!Running) return;
+                Running = false;
+                StopSession();   // ProcessTrace kehrt zurueck, der Thread endet
+                CloseTrace(trace);
+                lock (procs) procs.Clear();
+            }
+        }
+
+        static void OnRecord(IntPtr r)
+        {
+            // EVENT_RECORD.EventHeader: ProcessId @12, TimeStamp @16, ProviderId @24, EventDescriptor.Id @40
+            uint d1 = (uint)Marshal.ReadInt32(r, 24);
+            int id = (ushort)Marshal.ReadInt16(r, 40), src;
+            if (d1 == 0xCA11C036) { if (id != 42 && id != 55) return; src = 0; }
+            else if (d1 == 0x783ACA0A) { if (id != 1) return; src = 1; }
+            else if (d1 == 0x802EC45A) { if (id != 184) return; src = 2; }
+            else return;
+            int pid = Marshal.ReadInt32(r, 12);
+            long ts = Marshal.ReadInt64(r, 16);
+            lock (procs)
+            {
+                Frames f;
+                if (!procs.TryGetValue(pid, out f)) { f = new Frames(); procs[pid] = f; }
+                long[] t = f.T[src];
+                t[f.N[src] % t.Length] = ts;
+                f.N[src]++;
+                f.Last = ts;
+            }
+        }
+
+        // Bilder pro Sekunde von pid ueber die letzte Sekunde; bevorzugt die Quelle der Grafik-API (genauer als der Kernel).
+        // false = der Prozess hat noch kein Bild ausgegeben; fps 0 = gibt gerade keine aus (Pause, minimiert)
+        public static bool Measure(int pid, out double fps, out string api)
+        {
+            fps = 0;
+            api = "";
+            long now = Stopwatch.GetTimestamp(), sec = Stopwatch.Frequency;
+            lock (procs)
+            {
+                Frames f;
+                if (!procs.TryGetValue(pid, out f)) return false;
+                for (int s = 0; s < 3; s++)
+                {
+                    long[] t = f.T[s];
+                    int n = f.N[s];
+                    if (n == 0) continue;
+                    long newest = t[(n - 1) % t.Length];
+                    if (now - newest > sec * 3 / 2) continue;   // Quelle seit 1,5 s still (Auslieferung kommt gebuendelt)
+                    int k = 0;
+                    long first = newest;
+                    for (int i = n - 1; i >= 0 && i >= n - t.Length; i--)
+                    {
+                        long v = t[i % t.Length];
+                        if (newest - v > sec) break;
+                        first = v;
+                        k++;
+                    }
+                    fps = k < 2 || newest == first ? k : (k - 1) * (double)sec / (newest - first);
+                    api = SrcNames[s];
+                    return true;
+                }
+                return true;
+            }
+        }
+
+        // Prozesse vergessen, die seit 10 s kein Bild ausgegeben haben
+        public static void Prune()
+        {
+            long now = Stopwatch.GetTimestamp();
+            lock (procs)
+            {
+                List<int> old = new List<int>();
+                foreach (KeyValuePair<int, Frames> kv in procs)
+                    if (now - kv.Value.Last > Stopwatch.Frequency * 10) old.Add(kv.Key);
+                foreach (int pid in old) procs.Remove(pid);
+            }
+        }
+    }
+
+    // GPU-Auslastung und -Temperatur ueber den Treiber des Herstellers: AMD per ADL (atiadlxx.dll), NVIDIA per NVML
+    // (nvml.dll), beide kommen mit dem Grafiktreiber. Sonst die Windows-Zaehler des Task-Managers (ohne Temperatur).
+    // Bei mehreren GPUs zaehlt die staerkste: eigene Grafikkarte vor integrierter, dann mehr Grafikspeicher
+    static class GpuMon
+    {
+        delegate IntPtr AdlMalloc(int size);
+        static readonly AdlMalloc adlMalloc = delegate(int size) { return Marshal.AllocHGlobal(size); };
+        [DllImport("atiadlxx.dll")] static extern int ADL2_Main_Control_Create(AdlMalloc cb, int connected, out IntPtr ctx);
+        [DllImport("atiadlxx.dll")] static extern int ADL2_Adapter_NumberOfAdapters_Get(IntPtr ctx, out int n);
+        [DllImport("atiadlxx.dll")] static extern int ADL2_Adapter_AdapterInfo_Get(IntPtr ctx, IntPtr info, int size);
+        [DllImport("atiadlxx.dll")] static extern int ADL2_Adapter_ASICFamilyType_Get(IntPtr ctx, int idx, out int types, out int valids);
+        [DllImport("atiadlxx.dll")] static extern int ADL2_Adapter_MemoryInfo2_Get(IntPtr ctx, int idx, IntPtr info);
+        [DllImport("atiadlxx.dll")] static extern int ADL2_New_QueryPMLogData_Get(IntPtr ctx, int idx, IntPtr data);
+        [DllImport("atiadlxx.dll")] static extern int ADL2_OverdriveN_Temperature_Get(IntPtr ctx, int idx, int type, out int milliC);
+        [DllImport("atiadlxx.dll")] static extern int ADL2_OverdriveN_PerformanceStatus_Get(IntPtr ctx, int idx, IntPtr status);
+
+        [StructLayout(LayoutKind.Sequential)] struct NvUtil { public uint Gpu, Mem; }
+        [StructLayout(LayoutKind.Sequential)] struct NvMem { public ulong Total, Free, Used; }
+        [DllImport("nvml.dll")] static extern int nvmlInit_v2();
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetCount_v2(out uint n);
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetHandleByIndex_v2(uint i, out IntPtr dev);
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetName(IntPtr dev, StringBuilder name, uint len);
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetMemoryInfo(IntPtr dev, out NvMem m);
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetUtilizationRates(IntPtr dev, out NvUtil u);
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetTemperature(IntPtr dev, int sensor, out uint c);
+
+        class Gpu
+        {
+            public string Name;
+            public bool Nvidia, Discrete, Integrated;
+            public long Mem;
+            public int AdlIndex;
+            public IntPtr Nv;
+        }
+
+        // ADL-Sensoren (ADL_PMLOG_*): Werte in Prozent bzw. Grad Celsius
+        const int PM_TEMP_EDGE = 8, PM_ACTIVITY_GFX = 19, PM_TEMP_HOTSPOT = 27, PM_TEMP_SOC = 29, PM_TEMP_CPU = 32;
+        const int PM_SIZE = 4 + 256 * 8;   // ADLPMLogDataOutput: Groesse + 256 x {supported, value}
+        static IntPtr adl, pmlog;
+        static Gpu best, amdIgpu;          // amdIgpu: integrierte AMD-Grafik, liefert ggf. die CPU-/SoC-Temperatur
+        static bool inited;
+        public static bool ForceWindows;   // nur zum Testen: Treiber ignorieren
+        public static string Name = "", Source = "";
+
+        static void Init()
+        {
+            inited = true;
+            List<Gpu> all = new List<Gpu>();
+            if (!ForceWindows)
+            {
+                try { InitAdl(all); } catch { }   // kein AMD-Treiber: DllNotFoundException
+                try { InitNvml(all); } catch { }
+            }
+            foreach (Gpu g in all)
+                if (best == null || (g.Discrete && !best.Discrete) || (g.Discrete == best.Discrete && g.Mem > best.Mem)) best = g;
+            if (best != null) { Name = best.Name; Source = best.Nvidia ? "NVIDIA-Treiber" : "AMD-Treiber"; }
+            else { Name = "GPU"; Source = "Windows-Zähler"; }
+        }
+
+        static void InitAdl(List<Gpu> all)
+        {
+            if (ADL2_Main_Control_Create(adlMalloc, 1, out adl) != 0) return;
+            int n;
+            if (ADL2_Adapter_NumberOfAdapters_Get(adl, out n) != 0 || n <= 0) return;
+            const int SZ = 1572;   // sizeof(AdapterInfo)
+            IntPtr buf = Marshal.AllocHGlobal(SZ * n), mem = Marshal.AllocHGlobal(512);
+            try
+            {
+                for (int i = 0; i < SZ * n; i++) Marshal.WriteByte(buf, i, 0);
+                if (ADL2_Adapter_AdapterInfo_Get(adl, buf, SZ * n) != 0) return;
+                HashSet<int> buses = new HashSet<int>();   // je Grafikkarte mehrere Eintraege (einer pro Ausgang)
+                for (int i = 0; i < n; i++)
+                {
+                    IntPtr a = new IntPtr(buf.ToInt64() + (long)i * SZ);
+                    int idx = Marshal.ReadInt32(a, 4), bus = Marshal.ReadInt32(a, 264);
+                    if (Marshal.ReadInt32(a, 792) == 0 || !buses.Add(bus)) continue;   // iPresent
+                    Gpu g = new Gpu();
+                    g.AdlIndex = idx;
+                    g.Name = (Marshal.PtrToStringAnsi(new IntPtr(a.ToInt64() + 280)) ?? "AMD").Trim();
+                    int types, valids;
+                    if (ADL2_Adapter_ASICFamilyType_Get(adl, idx, out types, out valids) == 0)
+                    {
+                        g.Discrete = (types & valids & 1) != 0;     // ADL_ASIC_DISCRETE
+                        g.Integrated = (types & valids & 2) != 0;   // ADL_ASIC_INTEGRATED
+                    }
+                    for (int b = 0; b < 8; b++) Marshal.WriteByte(mem, b, 0);
+                    if (ADL2_Adapter_MemoryInfo2_Get(adl, idx, mem) == 0) g.Mem = Marshal.ReadInt64(mem, 0);
+                    all.Add(g);
+                    if (g.Integrated && amdIgpu == null) amdIgpu = g;
+                }
+            }
+            finally { Marshal.FreeHGlobal(buf); Marshal.FreeHGlobal(mem); }
+        }
+
+        static void InitNvml(List<Gpu> all)
+        {
+            if (nvmlInit_v2() != 0) return;
+            uint n;
+            if (nvmlDeviceGetCount_v2(out n) != 0) return;
+            for (uint i = 0; i < n; i++)
+            {
+                IntPtr d;
+                if (nvmlDeviceGetHandleByIndex_v2(i, out d) != 0) continue;
+                Gpu g = new Gpu();
+                g.Nvidia = g.Discrete = true;
+                g.Nv = d;
+                StringBuilder sb = new StringBuilder(96);
+                g.Name = nvmlDeviceGetName(d, sb, 96) == 0 ? sb.ToString() : "NVIDIA";
+                NvMem m;
+                if (nvmlDeviceGetMemoryInfo(d, out m) == 0) g.Mem = (long)m.Total;
+                all.Add(g);
+            }
+        }
+
+        // ADL-Sensor aus dem letzten PMLog-Abruf, -1 = nicht unterstuetzt
+        static float Pm(int i)
+        {
+            return Marshal.ReadInt32(pmlog, 4 + i * 8) != 0 ? Marshal.ReadInt32(pmlog, 8 + i * 8) : -1;
+        }
+
+        static bool QueryPm(int idx)
+        {
+            if (pmlog == IntPtr.Zero) pmlog = Marshal.AllocHGlobal(PM_SIZE);
+            for (int i = 0; i < PM_SIZE; i++) Marshal.WriteByte(pmlog, i, 0);
+            return ADL2_New_QueryPMLogData_Get(adl, idx, pmlog) == 0;
+        }
+
+        // Auslastung in Prozent und Temperatur in Grad Celsius, -1 = unbekannt. Laeuft im Mess-Thread
+        public static void Read(out float load, out float temp)
+        {
+            load = temp = -1;
+            if (!inited) Init();
+            try
+            {
+                if (best == null) { load = ReadWindows(); return; }
+                if (best.Nvidia)
+                {
+                    NvUtil u;
+                    uint c;
+                    if (nvmlDeviceGetUtilizationRates(best.Nv, out u) == 0) load = u.Gpu;
+                    if (nvmlDeviceGetTemperature(best.Nv, 0, out c) == 0) temp = c;   // NVML_TEMPERATURE_GPU
+                    return;
+                }
+                if (QueryPm(best.AdlIndex))   // RDNA / Vega (Overdrive 8)
+                {
+                    load = Pm(PM_ACTIVITY_GFX);
+                    temp = Pm(PM_TEMP_EDGE);
+                    if (temp < 0) temp = Pm(PM_TEMP_HOTSPOT);
+                    return;
+                }
+                // aeltere Karten (OverdriveN)
+                int mc;
+                if (ADL2_OverdriveN_Temperature_Get(adl, best.AdlIndex, 1, out mc) == 0) temp = mc / 1000f;
+                IntPtr st = Marshal.AllocHGlobal(256);
+                try
+                {
+                    for (int i = 0; i < 256; i++) Marshal.WriteByte(st, i, 0);
+                    if (ADL2_OverdriveN_PerformanceStatus_Get(adl, best.AdlIndex, st) == 0) load = Marshal.ReadInt32(st, 24);   // iGPUActivityPercent
+                }
+                finally { Marshal.FreeHGlobal(st); }
+            }
+            catch { }
+        }
+
+        // Temperatur der CPU ueber die integrierte AMD-Grafik: CPU-Sensor (APUs), sonst SoC; -1 = keiner
+        public static float AmdCpuTemp(out bool soc)
+        {
+            soc = false;
+            if (!inited) Init();
+            if (amdIgpu == null) return -1;
+            try
+            {
+                if (!QueryPm(amdIgpu.AdlIndex)) return -1;
+                float t = Pm(PM_TEMP_CPU);
+                if (t > 0) return t;
+                soc = true;
+                return Pm(PM_TEMP_SOC);
+            }
+            catch { return -1; }
+        }
+
+        // Windows-Zaehler "GPU Engine": 3D-Auslastung je Grafikkarte, die am meisten beschaeftigte zaehlt
+        static PerformanceCounterCategory engCat;
+        static Dictionary<string, CounterSample> engPrev;
+
+        static float ReadWindows()
+        {
+            if (engCat == null) engCat = new PerformanceCounterCategory("GPU Engine");
+            InstanceDataCollection util = engCat.ReadCategory()["Utilization Percentage"];
+            if (util == null) return -1;
+            Dictionary<string, CounterSample> cur = new Dictionary<string, CounterSample>();
+            Dictionary<string, float> perGpu = new Dictionary<string, float>();
+            foreach (InstanceData d in util.Values)
+            {
+                string inst = d.InstanceName;   // pid_123_luid_0x00000000_0x0000D1A2_phys_0_eng_0_engtype_3D
+                if (!inst.EndsWith("engtype_3D", StringComparison.OrdinalIgnoreCase)) continue;
+                cur[inst] = d.Sample;
+                CounterSample old;
+                if (engPrev == null || !engPrev.TryGetValue(inst, out old)) continue;
+                int a = inst.IndexOf("luid_"), b = inst.IndexOf("_phys");
+                string luid = a >= 0 && b > a ? inst.Substring(a, b - a) : "";
+                float v;
+                perGpu.TryGetValue(luid, out v);
+                perGpu[luid] = v + CounterSample.Calculate(old, d.Sample);
+            }
+            engPrev = cur;
+            float max = -1;
+            foreach (float v in perGpu.Values) max = Math.Max(max, Math.Min(v, 100f));
+            return max;
+        }
+    }
+
+    // CPU-Auslastung (GetSystemTimes) und Temperatur. Eine echte Kern-Temperatur bekommt man unter Windows nur ueber
+    // einen Kernel-Treiber; ohne den: CPU- bzw. SoC-Sensor der integrierten AMD-Grafik, sonst ACPI-Thermalzone
+    static class CpuMon
+    {
+        [DllImport("kernel32.dll")] static extern bool GetSystemTimes(out long idle, out long kernel, out long user);
+        static long pIdle, pBusy;
+        static PerformanceCounterCategory zoneCat;
+        static bool zoneTried;
+        public static string TempSource = "";
+
+        public static float Load()
+        {
+            long idle, kernel, user;
+            if (!GetSystemTimes(out idle, out kernel, out user)) return -1;
+            long total = kernel + user;   // kernel enthaelt idle
+            long dIdle = idle - pIdle, dTotal = total - pBusy;
+            bool first = pBusy == 0;
+            pIdle = idle;
+            pBusy = total;
+            if (first || dTotal <= 0) return -1;
+            return Math.Max(0f, Math.Min(100f, 100f * (dTotal - dIdle) / dTotal));
+        }
+
+        public static float Temp()
+        {
+            bool soc;
+            float t = GpuMon.AmdCpuTemp(out soc);
+            if (t > 0) { TempSource = soc ? "SoC-Sensor" : "AMD-Treiber"; return t; }
+            try
+            {
+                if (!zoneTried) { zoneTried = true; if (PerformanceCounterCategory.Exists("Thermal Zone Information")) zoneCat = new PerformanceCounterCategory("Thermal Zone Information"); }
+                if (zoneCat != null)
+                {
+                    InstanceDataCollection z = zoneCat.ReadCategory()["Temperature"];   // Kelvin
+                    float max = -1;
+                    if (z != null) foreach (InstanceData d in z.Values) max = Math.Max(max, d.RawValue - 273.15f);
+                    if (max > 5 && max < 125) { TempSource = "ACPI"; return max; }
+                }
+            }
+            catch { zoneCat = null; }
+            TempSource = "";
+            return -1;
+        }
+    }
+
+    // Ein Messstand; Werte -1 = unbekannt
+    sealed class PerfSnap
+    {
+        public float Fps = -1, FrameMs = -1, GpuLoad = -1, GpuTemp = -1, CpuLoad = -1, CpuTemp = -1;
+        public string Proc = "", Api = "", Gpu = "", GpuSrc = "", CpuTempSrc = "";
+        public int EtwError;
+        public bool Ready;   // Sensoren mindestens einmal gelesen
+    }
+
+    // Mess-Thread: FPS des Programms im Vordergrund alle 500 ms, Sensoren jede Sekunde. Laeuft nur, solange
+    // die FPS-Anzeige an oder ihre Seite offen ist; aus beendet auch die ETW-Sitzung
+    static class Perf
+    {
+        public static volatile PerfSnap Now = new PerfSnap();
+        static volatile bool want;
+        static Thread worker;
+        static readonly AutoResetEvent wake = new AutoResetEvent(false);
+        static readonly int ownPid = Process.GetCurrentProcess().Id;
+
+        public static void SetActive(bool on)
+        {
+            if (on == want) return;
+            want = on;
+            if (on && worker == null)
+            {
+                worker = new Thread(Loop);
+                worker.IsBackground = true;
+                worker.Name = "Perf";
+                worker.Start();
+            }
+            wake.Set();
+        }
+
+        // Sensoren getrennt von der FPS-Messung lesen: das erste Lesen der Windows-Zaehler dauert bis zu Sekunden
+        static readonly object sensLock = new object();
+        static float gl = -1, gt = -1, cl = -1, ct = -1;
+        static bool ready, sensBusy;
+
+        static void ReadSensors(object unused)
+        {
+            float l = -1, t = -1, c = -1, ctemp = -1;
+            try
+            {
+                GpuMon.Read(out l, out t);
+                c = CpuMon.Load();
+                ctemp = CpuMon.Temp();
+            }
+            catch { }
+            lock (sensLock) { gl = l; gt = t; cl = c; ct = ctemp; ready = true; sensBusy = false; }
+        }
+
+        static void Loop()
+        {
+            int targetPid = 0, nextSensors = 0, nextPrune = 0;
+            string targetExe = "";
+            while (true)
+            {
+                if (!want)
+                {
+                    FpsEtw.Stop();
+                    wake.WaitOne();
+                    FpsEtw.Error = 0;   // nach dem Wiedereinschalten neu versuchen (z. B. Zugriff inzwischen eingerichtet)
+                    continue;
+                }
+                try
+                {
+                    if (!FpsEtw.Running && FpsEtw.Error == 0) FpsEtw.Start();
+                    // Gemessen wird das Programm im Vordergrund; das eigene Fenster (Einstellungen) aendert nichts
+                    IntPtr fg = Native.GetForegroundWindow();
+                    uint pid = 0;
+                    string exe = fg == IntPtr.Zero ? null : Native.ExeOfWindow(fg, out pid);
+                    if (pid != 0 && pid != ownPid) { targetPid = (int)pid; targetExe = exe ?? ""; }
+
+                    int now = Environment.TickCount;
+                    if (now - nextSensors >= 0)
+                    {
+                        nextSensors = now + 1000;
+                        bool start;
+                        lock (sensLock) { start = !sensBusy; sensBusy = true; }
+                        if (start) ThreadPool.QueueUserWorkItem(ReadSensors);
+                    }
+                    if (now - nextPrune >= 0) { nextPrune = now + 5000; FpsEtw.Prune(); }
+
+                    PerfSnap s = new PerfSnap();
+                    double fps;
+                    string api;
+                    if (targetPid != 0 && FpsEtw.Measure(targetPid, out fps, out api))
+                    {
+                        s.Fps = (float)fps;
+                        s.FrameMs = fps > 0 ? (float)(1000.0 / fps) : -1;
+                        s.Api = api;
+                    }
+                    s.Proc = targetExe;
+                    lock (sensLock) { s.GpuLoad = gl; s.GpuTemp = gt; s.CpuLoad = cl; s.CpuTemp = ct; s.Ready = ready; }
+                    s.Gpu = GpuMon.Name; s.GpuSrc = GpuMon.Source; s.CpuTempSrc = CpuMon.TempSource;
+                    s.EtwError = FpsEtw.Error;
+                    Now = s;
+                }
+                catch { }
+                wake.WaitOne(500);
+            }
+        }
+    }
+
+    // FPS-Anzeige: dieselbe Fensterart wie die Tastenanzeige (klickdurchlaessig, frei verschiebbar, Groesse, Deckkraft,
+    // Kacheln anordnen), statt Tasten zeigen die Kacheln Messwerte
+    class FpsOverlayForm : KeyOverlayForm
+    {
+        // Reihenfolge = Schalter auf der Seite; Temperatur-Kacheln ohne eigenen Namen stehen neben der Auslastung
+        public static readonly Cap[] Tiles = {
+            new Cap("FPS",       "FPS:",   CapSrc.Key, 0,   8,  8, 92, 60),
+            new Cap("Frametime", "Frame:", CapSrc.Key, 0,   8, 72, 92, 28),
+            new Cap("GPU",       "GPU:",   CapSrc.Key, 0, 104,  8, 84, 28),
+            new Cap("GpuTemp",   "",       CapSrc.Key, 0, 192,  8, 64, 28),
+            new Cap("CPU",       "CPU:",   CapSrc.Key, 0, 104, 40, 84, 28),
+            new Cap("CpuTemp",   "",       CapSrc.Key, 0, 192, 40, 64, 28) };
+        public const string DefaultHidden = "Frametime";
+        static readonly string[] OwnerLabel = { "", "", "", "GPU:", "", "CPU:" };   // Name, wenn die Auslastung daneben fehlt
+        // Breitester uebliche Wert je Kachel: die Schriftgroesse richtet sich danach und springt nicht mit dem Wert
+        static readonly string[] WidestVal = { "888", "88,8 ms", "100%", "100°C", "100%", "100°C" };
+        readonly string[] vals = { "–", "–", "–", "–", "–", "–" };
+        int box = 65;   // Deckkraft des Hintergrunds (Kacheln und Rand) in Prozent, 0 = nur die Zahlen
+
+        public FpsOverlayForm(float dpi) : base(new KeyMon(), dpi, Tiles) { topEveryMs = 500; }
+
+        public void SetBox(int pct)
+        {
+            if (pct == box) return;
+            box = pct;
+            Touch();
+        }
+
+        public static RectangleF[] DefaultTileLayout() { return DefaultLayout(Tiles); }
+
+        static string Pct(float v) { return v < 0 ? "–" : Math.Round(v).ToString("0") + "%"; }
+        static string Deg(float v) { return v <= 0 ? "–" : Math.Round(v).ToString("0") + "°C"; }
+
+        public void SetValues(PerfSnap s)
+        {
+            string[] n = {
+                s.Fps < 0 ? "–" : Math.Round(s.Fps).ToString("0"),
+                s.FrameMs < 0 ? "–" : s.FrameMs.ToString("0.0") + " ms",
+                Pct(s.GpuLoad), Deg(s.GpuTemp), Pct(s.CpuLoad), Deg(s.CpuTemp) };
+            bool changed = false;
+            for (int i = 0; i < vals.Length; i++) if (vals[i] != n[i]) { vals[i] = n[i]; changed = true; }
+            if (changed) Touch();
+        }
+
+        // Beispielwerte fuer den Snapshot
+        public static PerfSnap Demo()
+        {
+            PerfSnap s = new PerfSnap();
+            s.Fps = 144; s.FrameMs = 6.9f; s.GpuLoad = 78; s.GpuTemp = 61; s.CpuLoad = 23; s.CpuTemp = 54;
+            s.Proc = "game.exe"; s.Api = "DXGI"; s.Gpu = "AMD Radeon RX 7800 XT"; s.GpuSrc = "AMD-Treiber";
+            s.CpuTempSrc = "SoC-Sensor"; s.Ready = true;
+            return s;
+        }
+
+        // Breite von s in Schriftgroesse size (Pixel)
+        float TextW(Graphics g, string s, float size)
+        {
+            if (s.Length == 0 || size < 1) return 0;
+            using (Font f = new Font(family, size, style, GraphicsUnit.Pixel))
+                return g.MeasureString(s, f, 4000, StringFormat.GenericTypographic).Width;
+        }
+
+        // Groesse, bei der s hoechstens width breit ist (nie groesser als size)
+        float FitSize(Graphics g, string s, float width, float size)
+        {
+            float w = TextW(g, s, size);
+            return w > width && w > 0 ? Math.Max(4f, size * width / w) : size;
+        }
+
+        // Text mit dunkler Kontur: bleibt auf hellem Spielbild lesbar, auch ganz ohne Hintergrund
+        void Outlined(Graphics g, string s, RectangleF r, float size, Color fill, float alpha, StringAlignment al)
+        {
+            if (s.Length == 0 || r.Width <= 1 || size < 4f) return;
+            FontFamily ff;
+            try { ff = new FontFamily(family); } catch { ff = new FontFamily(GenericFontFamilies.SansSerif); }
+            using (ff)
+            using (GraphicsPath p = new GraphicsPath())
+            using (StringFormat sf = new StringFormat(StringFormat.GenericTypographic))
+            {
+                sf.Alignment = al;
+                sf.LineAlignment = StringAlignment.Center;
+                sf.FormatFlags |= StringFormatFlags.NoWrap | StringFormatFlags.NoClip;
+                int fs = (int)style;
+                if (!ff.IsStyleAvailable(style)) fs = (int)FontStyle.Regular;
+                // Rahmen hoch genug fuer die ganze Zeile (sonst laesst AddString sie weg), um die Mitte von r
+                RectangleF lr = new RectangleF(r.X, r.Y + r.Height / 2f - size, r.Width, size * 2f);
+                p.AddString(s, ff, fs, size, lr, sf);
+                using (Pen pen = new Pen(Fade(box == 0 ? 230 : 190, Color.FromArgb(0, 0, 0), alpha), Math.Max(1.6f, size * 0.17f)))
+                {
+                    pen.LineJoin = LineJoin.Round;
+                    g.DrawPath(pen, p);
+                }
+                using (SolidBrush b = new SolidBrush(fill)) g.FillPath(b, p);
+            }
+        }
+
+        // Liegen a und b aneinander (Luecke hoechstens 2 px, eingerastet 0) mit gemeinsamer Kante, oder ueberlappen sie?
+        static bool Joined(RectangleF a, RectangleF b)
+        {
+            float ox = Math.Min(a.Right, b.Right) - Math.Max(a.Left, b.Left);
+            float oy = Math.Min(a.Bottom, b.Bottom) - Math.Max(a.Top, b.Top);
+            return (ox >= -2f && oy >= 6f) || (oy >= -2f && ox >= 6f);
+        }
+
+        // Liegt der Punkt auf irgendeiner sichtbaren Kachel?
+        bool OnTile(float x, float y)
+        {
+            for (int i = 0; i < caps.Length; i++) if (show[i] && caps[i].R.Contains(x, y)) return true;
+            return false;
+        }
+
+        // Steg ueber die Fuge zweier aneinanderliegender Kacheln; inset > 0 = Innenflaeche (ohne Rand). Die Enden
+        // ruecken nur dort ein, wo der Aussenrand verlaeuft; stossen weitere Kacheln an, geht der Steg durch
+        void AddBridge(GraphicsPath p, RectangleF a, RectangleF b, float inset)
+        {
+            float ox = Math.Min(a.Right, b.Right) - Math.Max(a.Left, b.Left);
+            float oy = Math.Min(a.Bottom, b.Bottom) - Math.Max(a.Top, b.Top);
+            if (ox > 0 && oy > 0 && ox >= 6f && oy >= 6f) return;   // ueberlappen: die Flaechen decken sich ohnehin
+            if (oy >= 6f)
+            {
+                RectangleF l = a.Left <= b.Left ? a : b, r = a.Left <= b.Left ? b : a;
+                float jx = (l.Right + r.Left) / 2f, y1 = Math.Max(a.Top, b.Top), y2 = Math.Min(a.Bottom, b.Bottom);
+                y1 = OnTile(jx, y1 - 1.5f) ? y1 - inset - 1f : y1 + inset;
+                y2 = OnTile(jx, y2 + 1.5f) ? y2 + inset + 1f : y2 - inset;
+                if (y2 > y1) p.AddRectangle(RectangleF.FromLTRB(Math.Min(l.Right, r.Left) - inset - 1f, y1, Math.Max(l.Right, r.Left) + inset + 1f, y2));
+            }
+            else
+            {
+                RectangleF t = a.Top <= b.Top ? a : b, u = a.Top <= b.Top ? b : a;
+                float jy = (t.Bottom + u.Top) / 2f, x1 = Math.Max(a.Left, b.Left), x2 = Math.Min(a.Right, b.Right);
+                x1 = OnTile(x1 - 1.5f, jy) ? x1 - inset - 1f : x1 + inset;
+                x2 = OnTile(x2 + 1.5f, jy) ? x2 + inset + 1f : x2 - inset;
+                if (x2 > x1) p.AddRectangle(RectangleF.FromLTRB(x1, Math.Min(t.Bottom, u.Top) - inset - 1f, x2, Math.Max(t.Bottom, u.Top) + inset + 1f));
+            }
+        }
+
+        // Rechteck mit eigenem Radius je Ecke (oben links, oben rechts, unten rechts, unten links), im Uhrzeigersinn
+        // wie AddRectangle, damit sich alles mit FillMode.Winding zu einer Flaeche vereinigt
+        static GraphicsPath Corners(RectangleF r, float[] rad)
+        {
+            GraphicsPath p = new GraphicsPath();
+            float tl = rad[0] * 2, tr = rad[1] * 2, br = rad[2] * 2, bl = rad[3] * 2;
+            if (tl > 0) p.AddArc(r.X, r.Y, tl, tl, 180, 90); else p.AddLine(r.X, r.Y, r.X, r.Y);
+            if (tr > 0) p.AddArc(r.Right - tr, r.Y, tr, tr, 270, 90); else p.AddLine(r.Right, r.Y, r.Right, r.Y);
+            if (br > 0) p.AddArc(r.Right - br, r.Bottom - br, br, br, 0, 90); else p.AddLine(r.Right, r.Bottom, r.Right, r.Bottom);
+            if (bl > 0) p.AddArc(r.X, r.Bottom - bl, bl, bl, 90, 90); else p.AddLine(r.X, r.Bottom, r.X, r.Bottom);
+            p.CloseFigure();
+            return p;
+        }
+
+        // Liegt der Punkt (knapp ausserhalb einer Ecke von Kachel i) auf einer anliegenden Kachel? Dann bleibt die Ecke eckig
+        bool CoveredByNeighbor(int i, float x, float y)
+        {
+            for (int j = 0; j < caps.Length; j++)
+            {
+                if (j == i || !show[j] || !Joined(caps[i].R, caps[j].R)) continue;
+                RectangleF n = caps[j].R;
+                n.Inflate(2f, 2f);
+                if (n.Contains(x, y)) return true;
+            }
+            return false;
+        }
+
+        // Hintergrund aller Kacheln: aneinanderliegende verschmelzen zu einer Box (eckige Fugen, Rand nur aussen).
+        // Rand und Innenflaeche werden deckend in eine Ebene gezeichnet und mit der Deckkraft der Kacheln uebertragen,
+        // so faerbt keine Ueberlappung doppelt
+        // g ist bereits auf logische Pixel skaliert; field = gezeichneter Ausschnitt in logischen Pixeln
+        void DrawBoxes(Graphics g, float alpha, RectangleF field)
+        {
+            const float bw = 1.2f;   // Randbreite (logische Pixel)
+            if (box <= 0) return;    // Hintergrund ganz aus: nur die Zahlen
+            float dev;
+            using (Matrix mx = g.Transform) dev = Math.Abs(mx.Elements[0]);   // Geraetepixel je logischem Pixel
+            if (dev <= 0.01f) dev = 1f;
+            int pw = Math.Max(1, (int)Math.Ceiling(field.Width * dev)), ph = Math.Max(1, (int)Math.Ceiling(field.Height * dev));
+            using (GraphicsPath outer = new GraphicsPath(FillMode.Winding))
+            using (GraphicsPath inner = new GraphicsPath(FillMode.Winding))
+            using (Bitmap layer = new Bitmap(pw, ph, PixelFormat.Format32bppArgb))
+            {
+                for (int i = 0; i < caps.Length; i++)
+                {
+                    if (!show[i]) continue;
+                    RectangleF r = caps[i].R;
+                    float rad = Math.Min(radius, Math.Min(r.Width, r.Height) / 2f);
+                    float[] ro = {
+                        CoveredByNeighbor(i, r.Left - 1.5f, r.Top + 1f) || CoveredByNeighbor(i, r.Left + 1f, r.Top - 1.5f) ? 0 : rad,
+                        CoveredByNeighbor(i, r.Right + 1.5f, r.Top + 1f) || CoveredByNeighbor(i, r.Right - 1f, r.Top - 1.5f) ? 0 : rad,
+                        CoveredByNeighbor(i, r.Right + 1.5f, r.Bottom - 1f) || CoveredByNeighbor(i, r.Right - 1f, r.Bottom + 1.5f) ? 0 : rad,
+                        CoveredByNeighbor(i, r.Left - 1.5f, r.Bottom - 1f) || CoveredByNeighbor(i, r.Left + 1f, r.Bottom + 1.5f) ? 0 : rad };
+                    float[] ri = new float[4];
+                    for (int k = 0; k < 4; k++) ri[k] = ro[k] > 0 ? Math.Max(0.5f, ro[k] - bw) : 0;
+                    RectangleF rIn = r;
+                    rIn.Inflate(-bw, -bw);
+                    using (GraphicsPath po = Corners(r, ro)) outer.AddPath(po, false);
+                    if (rIn.Width > 0 && rIn.Height > 0) using (GraphicsPath pi = Corners(rIn, ri)) inner.AddPath(pi, false);
+                    for (int j = i + 1; j < caps.Length; j++)
+                    {
+                        if (!show[j] || !Joined(r, caps[j].R)) continue;
+                        AddBridge(outer, r, caps[j].R, 0);
+                        AddBridge(inner, r, caps[j].R, bw);
+                    }
+                }
+                using (Graphics lg = Graphics.FromImage(layer))
+                {
+                    lg.SmoothingMode = SmoothingMode.AntiAlias;
+                    lg.ScaleTransform(dev, dev);
+                    lg.TranslateTransform(-field.X, -field.Y);
+                    using (SolidBrush b = new SolidBrush(Color.FromArgb(120, 120, 126))) lg.FillPath(b, outer);
+                    using (SolidBrush b = new SolidBrush(Color.FromArgb(10, 10, 12))) lg.FillPath(b, inner);
+                }
+                ColorMatrix cm = new ColorMatrix();
+                cm.Matrix33 = box / 100f * alpha;
+                using (ImageAttributes ia = new ImageAttributes())
+                {
+                    ia.SetColorMatrix(cm);
+                    InterpolationMode im = g.InterpolationMode;
+                    PixelOffsetMode pm = g.PixelOffsetMode;
+                    g.InterpolationMode = InterpolationMode.NearestNeighbor;
+                    g.PixelOffsetMode = PixelOffsetMode.Half;
+                    PointF[] dst = { new PointF(field.X, field.Y), new PointF(field.X + pw / dev, field.Y), new PointF(field.X, field.Y + ph / dev) };
+                    g.DrawImage(layer, dst, new RectangleF(0, 0, pw, ph), GraphicsUnit.Pixel, ia);
+                    g.InterpolationMode = im;
+                    g.PixelOffsetMode = pm;
+                }
+            }
+        }
+
+        public override void Draw(Graphics g, KeyMon m, float sc, float alpha, bool crop)
+        {
+            GraphicsState st = g.Save();
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+            RectangleF field = crop ? Area() : new RectangleF(0, 0, W, H);
+            g.ScaleTransform(sc, sc);
+            if (crop) g.TranslateTransform(-field.X, -field.Y);
+            DrawBoxes(g, alpha, field);
+            Color dim = Fade(240, Color.FromArgb(205, 205, 215), alpha);
+            for (int i = 0; i < caps.Length; i++)
+            {
+                if (!show[i]) continue;
+                RectangleF r = caps[i].R;
+                string label = caps[i].Label;
+                if (label.Length == 0 && i > 0 && !show[i - 1]) label = OwnerLabel[i];
+                Color vc = Fade(255, i == 0 ? accent : Color.FromArgb(255, 255, 255), alpha);
+                // Groesse nach dem breitesten ueblichen Wert (bzw. dem aktuellen, falls breiter): springt nicht mit dem Wert
+                string widest = TextW(g, vals[i], 10f) > TextW(g, WidestVal[i], 10f) ? vals[i] : WidestVal[i];
+                if (r.Height >= 40f)
+                {
+                    // gestapelt: Name klein oben, Wert gross darunter
+                    float lh = r.Height * 0.3f;
+                    RectangleF lr = new RectangleF(r.X + 4, r.Y + r.Height * 0.05f, r.Width - 8, lh);
+                    RectangleF vr = new RectangleF(r.X + 4, r.Y + lh, r.Width - 8, r.Height - lh - r.Height * 0.05f);
+                    Outlined(g, label, lr, FitSize(g, label, lr.Width, r.Height * 0.2f), dim, alpha, StringAlignment.Center);
+                    Outlined(g, vals[i], vr, FitSize(g, widest, vr.Width, r.Height * 0.52f), vc, alpha, StringAlignment.Center);
+                }
+                else
+                {
+                    // nebeneinander: Name links, Wert rechts; passt beides nicht, schrumpfen Name und Wert gemeinsam
+                    float pad = Math.Min(6f, r.Width * 0.08f), ls = r.Height * 0.42f, vs = r.Height * 0.6f;
+                    float lw = TextW(g, label, ls), gap = label.Length > 0 ? r.Height * 0.15f : 0, vw = TextW(g, widest, vs);
+                    float avail = r.Width - 2 * pad, need = lw + gap + vw;
+                    if (need > avail && need > 0) { float k = avail / need; ls *= k; vs *= k; lw *= k; gap *= k; }
+                    if (label.Length > 0)
+                        Outlined(g, label, new RectangleF(r.X + pad, r.Y, lw + 2, r.Height), ls, dim, alpha, StringAlignment.Near);
+                    RectangleF vr = label.Length > 0 ? RectangleF.FromLTRB(r.X + pad + lw + gap, r.Y, r.Right - pad, r.Bottom)
+                                                     : new RectangleF(r.X + pad, r.Y, avail, r.Height);
+                    Outlined(g, vals[i], vr, vs, vc, alpha, label.Length > 0 ? StringAlignment.Far : StringAlignment.Center);
+                }
+            }
+            g.Restore(st);
         }
     }
 
@@ -2008,7 +2869,8 @@ namespace PurpleClicker
         KeysBtn, KsSw, KsCorner, KsMove, KsScale, KsOpacity, KsMargin, KsKey, KsCap, KsSnap, KsReset, KsPreview,
         KsHot, KsGlobal, KsProg, KsProgX, KsProgAdd,
         SettingsBtn, StBarSw, StProcX, StProcAdd, StStart, ClickBtn,
-        LinkDoc, LinkRepo, LinkHome
+        LinkDoc, LinkRepo, LinkHome,
+        FpsBtn, FsFull, FsGrant, FsBox
     }
 
     // ------------------------------------------------------------------ Fenster
@@ -2020,15 +2882,15 @@ namespace PurpleClicker
         // Titelleiste rechts: [Funktionen ...] [Farbrad] [Einstellungen] [Min] [X]; Funktionen rechtsbuendig,
         // ausgeblendete hinterlassen keine Luecke (LayoutTitle setzt die Rechtecke, leer = nicht sichtbar)
         static readonly Rectangle R_SettingsBtn = new Rectangle(574, 13, 30, 30);
-        Rectangle R_Gear, R_ClickBtn, R_KeysBtn, R_ArtyBtn, R_BattBtn, R_MouseBtn;
+        Rectangle R_Gear, R_ClickBtn, R_KeysBtn, R_FpsBtn, R_ArtyBtn, R_BattBtn, R_MouseBtn;
         // Symbole in der Leiste je Funktion f, zugehoerige Seite (-1 = Theme-Auswahl, keine Seite).
         // f bleibt fest (INI, Treffer); die Reihenfolge links -> rechts steht in BarOrder
-        const int BarCount = 6, BAR_THEME = 4, BAR_CLICK = 5;
-        static readonly string[] BarNames = { "Tastenanzeige", "Wardogs-Rechner", "Akku", "Maus-Umbelegung", "Theme-Auswahl", "Autoclicker" };
-        static readonly int[] BarPage = { 4, 3, 2, 1, -1, 0 };
-        static readonly string[] BarKeys = { "BarKeys", "BarArty", "BarBatt", "BarMouse", "BarTheme", "BarClick" };   // INI-Schluessel
-        static readonly int[] BarOrder = { BAR_CLICK, 0, 1, 2, 3, BAR_THEME };
-        readonly bool[] barShow = { true, true, true, true, true, true };
+        const int BarCount = 7, BAR_THEME = 4, BAR_CLICK = 5, BAR_FPS = 6;
+        static readonly string[] BarNames = { "Tastenanzeige", "Wardogs-Rechner", "Akku", "Maus-Umbelegung", "Theme-Auswahl", "Autoclicker", "FPS-Anzeige" };
+        static readonly int[] BarPage = { 4, 3, 2, 1, -1, 0, 6 };
+        static readonly string[] BarKeys = { "BarKeys", "BarArty", "BarBatt", "BarMouse", "BarTheme", "BarClick", "BarFps" };   // INI-Schluessel
+        static readonly int[] BarOrder = { BAR_CLICK, 0, BAR_FPS, 1, 2, 3, BAR_THEME };
+        readonly bool[] barShow = { true, true, true, true, true, true, true };
         int startPage;                    // Seite beim Programmstart und hinter dem Logo (0 = Autoclicker)
         readonly List<string>[] barProcs = new List<string>[BarCount];   // nur wenn eines laeuft (im Konstruktor angelegt)
         readonly bool[] barRunning = new bool[BarCount];   // eines der Programme laeuft gerade
@@ -2065,7 +2927,7 @@ namespace PurpleClicker
         static readonly Rectangle R_StCard = new Rectangle(20, 64, 660, 428);
         static readonly Rectangle R_StAutoSw = new Rectangle(620, 96, 44, 24);
         // Tabelle "Leiste oben": je Zeile Symbol, Name, "nur wenn laeuft"-Chips, Schalter
-        const int ST_ROW_Y0 = 206, ST_ROW = 46, ST_CHIP_X0 = 262, ST_CHIP_X1 = 604, ST_CHIP_H = 24;
+        const int ST_ROW_Y0 = 206, ST_ROW = 40, ST_CHIP_X0 = 262, ST_CHIP_X1 = 604, ST_CHIP_H = 24;
         readonly List<Rectangle>[] stChipRects = new List<Rectangle>[BarCount];
         readonly Rectangle[] stAddRects = new Rectangle[BarCount];
         const int MAX_BAR_PROCS = 4;
@@ -2095,6 +2957,17 @@ namespace PurpleClicker
         static readonly Rectangle R_KsReset = new Rectangle(560, 402, 104, 24);
         const int KS_GRID = 4;                                                   // Raster beim Anordnen (logische Pixel)
         const float KS_SNAP = 5f;                                                // Fangabstand der Hilfslinien
+        // FPS-Seite: Aufbau wie die Tastenanzeige; Schalter je Kachel in zwei Spalten, darunter was gemessen wird,
+        // unten "Nur im Vollbild" und die benutzten Sensoren
+        static readonly string[] FsNames = { "FPS", "Frametime", "GPU-Auslastung", "GPU-Temperatur", "CPU-Auslastung", "CPU-Temperatur" };
+        const int FS_ROW = 22;
+        static readonly Rectangle R_FsStatus = new Rectangle(36, 402, 300, 24);
+        static readonly Rectangle R_FsGrant = new Rectangle(214, 402, 122, 24);  // "Zugriff einrichten" (nur ohne ETW-Rechte)
+        static readonly Rectangle R_FsFullHit = new Rectangle(30, 452, 186, 38);
+        const int FS_INFO_X = 230;
+        // Vier Schieber (Groesse, Deckkraft, Hintergrund, Abstand) statt drei: engere Zeilen, Schieber 24 unter dem Text
+        static readonly int[] FsRowY = { 242, 282, 322, 362 };
+        const int FS_SL_OFF = 24, KS_SL_OFF = 34;
         // Artillerie-Seite: links Felder + Ergebnis, rechts Zielliste, unten Knopf fuer die Schusstafel
         static readonly Rectangle R_ArCard = new Rectangle(20, 64, 660, 374);
         static readonly Rectangle R_ArPos = new Rectangle(118, 98, 302, 36);
@@ -2370,7 +3243,7 @@ namespace PurpleClicker
 
         Hotkey hotkey = new Hotkey(false, (int)Keys.F6);
         readonly Remapper remap = new Remapper();   // Maus-Umbelegung
-        int page;                                   // 0 = Hauptseite, 1 = Maus-Umbelegung, 2 = Akku, 3 = Artillerie, 4 = Tastenanzeige
+        int page;                                   // 0 = Hauptseite, 1 = Maus-Umbelegung, 2 = Akku, 3 = Artillerie, 4 = Tastenanzeige, 5 = Einstellungen, 6 = FPS-Anzeige
         int rmSel = -1;                             // im Mausbild gewaehlte Eingabe
         int mouseView;                              // 0 Auto, 1 Foto, 2 gezeichnet (5 Tasten), 3 gezeichnet (3 Tasten)
         Bitmap mousePhoto;                          // aus der exe, null wenn nicht eingebettet
@@ -2383,7 +3256,7 @@ namespace PurpleClicker
         string rmNote = "";
         Hotkey mulKey = new Hotkey(false, 0);   // Hotkey fuer den Multiplikator (Code 0 = keiner)
         bool capturing;
-        int capTarget;                          // 0 = Start/Stop-Hotkey, 1 = Multiplikator-Hotkey, 2 = Tastenanzeige
+        int capTarget;                          // 0 = Start/Stop-Hotkey, 1 = Multiplikator-Hotkey, 2 = Tastenanzeige, 3 = FPS-Anzeige
         int capModVk;                           // beim Belegen zuletzt gedrueckter Modifikator (allein losgelassen = Hotkey)
         readonly bool[] swallowUp = new bool[6];
         readonly HashSet<int> swallowedKeys = new HashSet<int>();
@@ -2471,6 +3344,20 @@ namespace PurpleClicker
         const string KeysDemo = "W,Shift,LMB,RadHoch";
         const int KeysPreviewMs = 3000;
 
+        // FPS-Anzeige: eigenes Overlay, Position, Hotkey und Kacheln; Messwerte kommen aus Perf
+        FpsOverlayForm fpsOverlay;
+        bool fpsOn;
+        readonly KeysPlace fpsPlace = new KeysPlace { Corner = 0 };   // Standard oben links, die Tastenanzeige sitzt oben rechts
+        Hotkey fpsKey = new Hotkey(false, 0);
+        bool[] fpsShow = KeyOverlayForm.ShowFromHidden(FpsOverlayForm.Tiles, FpsOverlayForm.DefaultHidden);
+        RectangleF[] fpsPos = FpsOverlayForm.DefaultTileLayout();
+        bool fpsSnap = true;
+        bool fpsFullOnly;                 // nur zeigen, solange ein Fenster seinen Bildschirm ganz fuellt (Spiel im Vollbild/randlos)
+        bool fpsFgFull;                   // Vordergrund fuellt den Bildschirm (eigenes Fenster: letzter Stand)
+        int fpsMargin = 20, fpsScale = 100, fpsOpacity = 85;
+        int fpsBox = 65;                  // Deckkraft des Hintergrunds (Kacheln + Rand), 0 = nur die Zahlen
+        readonly System.Windows.Forms.Timer perfTimer = new System.Windows.Forms.Timer();
+
         // Artillerie-Rechner
         readonly string[] arText = { "", "", "" };                        // Feldinhalt: 0 Position, 1 Ziel, 2 Tafel-Eingabe
         readonly double[] arX = { double.NaN, double.NaN }, arY = { double.NaN, double.NaN };
@@ -2524,7 +3411,16 @@ namespace PurpleClicker
                 rbPhase = (rbPhase + 2.2f) % 360f;
                 RainbowColors();
                 if (keysOn && keysOverlay != null && !keysOverlay.IsDisposed) KeysLook(keysOverlay);
+                if (fpsOn && fpsOverlay != null && !fpsOverlay.IsDisposed) KeysLook(fpsOverlay);
                 Invalidate();
+            };
+            // Messwerte ins Overlay und in die Vorschau der FPS-Seite
+            perfTimer.Interval = 500;
+            perfTimer.Tick += delegate
+            {
+                if (!NeedPerf()) { Perf.SetActive(false); perfTimer.Stop(); return; }
+                if (fpsOverlay != null && !fpsOverlay.IsDisposed) fpsOverlay.SetValues(Perf.Now);
+                if (page == 6 && Visible) Invalidate();
             };
 
             remap.OnClick = delegate(int b)
@@ -2618,6 +3514,11 @@ namespace PurpleClicker
             ksItem.Click += delegate { SetKeysOn(ksItem.Checked); };
             menu.Opening += delegate { ksItem.Checked = keysOn; };
             menu.Items.Add(ksItem);
+            ToolStripMenuItem fsItem = new ToolStripMenuItem("FPS-Anzeige");
+            fsItem.CheckOnClick = true;
+            fsItem.Click += delegate { SetFpsOn(fsItem.Checked); };
+            menu.Opening += delegate { fsItem.Checked = fpsOn; };
+            menu.Items.Add(fsItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Dokumentation", null, delegate { OpenUrl(DocUrl); });
             menu.Items.Add("Quellcode auf GitHub", null, delegate { OpenUrl(RepoUrl); });
@@ -2649,6 +3550,7 @@ namespace PurpleClicker
             catch { }
 
             if (keysOn) SetKeysOn(true);
+            if (fpsOn) SetFpsOn(true);
             UpdateFgTimer();
             ForegroundTick();
             BarCheck();
@@ -2699,7 +3601,7 @@ namespace PurpleClicker
                 r[f] = new Rectangle(x, 13, 30, 30);
                 x -= 38;
             }
-            R_KeysBtn = r[0]; R_ArtyBtn = r[1]; R_BattBtn = r[2]; R_MouseBtn = r[3]; R_Gear = r[BAR_THEME]; R_ClickBtn = r[BAR_CLICK];
+            R_KeysBtn = r[0]; R_ArtyBtn = r[1]; R_BattBtn = r[2]; R_MouseBtn = r[3]; R_Gear = r[BAR_THEME]; R_ClickBtn = r[BAR_CLICK]; R_FpsBtn = r[BAR_FPS];
         }
 
         // Startseite (Programmstart, Logo, Zurueck); ist sie gerade ausgeblendet: erste sichtbare Seite, sonst Einstellungen
@@ -2716,6 +3618,7 @@ namespace PurpleClicker
         {
             EndRecording(false);
             EndKeysPlacing();
+            EndFpsPlacing();
             page = HomePage();
             popupOpen = false;
             themeOpen = false;
@@ -2764,7 +3667,7 @@ namespace PurpleClicker
             for (int f = 0; f < BarCount; f++)
                 if (running[f] != barRunning[f]) { barRunning[f] = running[f]; changed = true; }
             for (int f = 0; f < BarCount; f++)
-                if (page == BarPage[f] && !BarVisible(f)) { EndRecording(false); EndKeysPlacing(); page = HomePage(); popupOpen = false; changed = true; }
+                if (page == BarPage[f] && !BarVisible(f)) { EndRecording(false); EndKeysPlacing(); EndFpsPlacing(); page = HomePage(); popupOpen = false; changed = true; }
             if (themeOpen && !BarVisible(BAR_THEME)) { themeOpen = false; changed = true; }
             if (changed && Visible) Invalidate();
         }
@@ -2921,10 +3824,10 @@ namespace PurpleClicker
         int KsCapAt(Point p, out int edges)
         {
             edges = 0;
-            for (int i = keysPos.Length - 1; i >= 0; i--)
+            for (int i = LayPos.Length - 1; i >= 0; i--)
             {
-                if (!keysShow[i]) continue;
-                RectangleF r = keysPos[i];
+                if (!LayShow[i]) continue;
+                RectangleF r = LayPos[i];
                 r.Offset(R_KsPrev.X, R_KsPrev.Y);
                 RectangleF outer = r;
                 outer.Inflate(3f, 3f);   // Rand auch knapp ausserhalb greifbar
@@ -2952,10 +3855,10 @@ namespace PurpleClicker
         {
             RectangleF all = RectangleF.Empty;
             bool any = false;
-            for (int j = 0; j < keysPos.Length; j++)
+            for (int j = 0; j < LayPos.Length; j++)
             {
-                if (j == i || !keysShow[j]) continue;
-                RectangleF o = keysPos[j];
+                if (j == i || !LayShow[j]) continue;
+                RectangleF o = LayPos[j];
                 xs.Add(o.Left); xs.Add(o.Left + o.Width / 2f); xs.Add(o.Right);
                 ys.Add(o.Top); ys.Add(o.Top + o.Height / 2f); ys.Add(o.Bottom);
                 all = any ? RectangleF.Union(all, o) : o;
@@ -2968,7 +3871,7 @@ namespace PurpleClicker
         // sonst im Raster; ohne Einrasten pixelgenau. offs = gepruefte Stellen relativ zu pos
         float KsAxis(float pos, float[] offs, List<float> cands)
         {
-            if (!keysSnap) return (float)Math.Round(pos);
+            if (!LaySnap) return (float)Math.Round(pos);
             float best = float.MaxValue, delta = 0;
             foreach (float off in offs)
                 foreach (float c in cands)
@@ -2995,7 +3898,7 @@ namespace PurpleClicker
             float dx = p.X - ksDragP0.X, dy = p.Y - ksDragP0.Y;
             const float mw = KeyOverlayForm.MinCapW, mh = KeyOverlayForm.MinCapH;
             List<float> cx = new List<float>(), cy = new List<float>();
-            if (keysSnap) KsGuideCands(ksDragCap, cx, cy);
+            if (LaySnap) KsGuideCands(ksDragCap, cx, cy);
             float[] one = { 0f };
             if (ksDragEdge == 0)
             {
@@ -3015,7 +3918,7 @@ namespace PurpleClicker
 
             ksGuideX.Clear();
             ksGuideY.Clear();
-            if (keysSnap)
+            if (LaySnap)
             {
                 if (ksDragEdge == 0)
                 {
@@ -3031,28 +3934,195 @@ namespace PurpleClicker
                 }
             }
             Invalidate();
-            if (r == keysPos[ksDragCap]) return;
-            keysPos[ksDragCap] = r;
-            try { KeysOverlay().SetLayout(keysPos); } catch { }
+            if (r == LayPos[ksDragCap]) return;
+            LayPos[ksDragCap] = r;
+            try { LayOverlay().SetLayout(LayPos); } catch { }
         }
 
         bool KsLayoutIsDefault()
         {
-            RectangleF[] d = KeyOverlayForm.DefaultLayout();
-            for (int i = 0; i < d.Length; i++) if (d[i] != keysPos[i]) return false;
+            RectangleF[] d = LayDefault();
+            for (int i = 0; i < d.Length; i++) if (d[i] != LayPos[i]) return false;
             return true;
         }
 
-        // Schieber der Tastenanzeige: 4 Groesse, 5 Deckkraft, 6 Abstand
+        // Schieber der Tastenanzeige bzw. FPS-Anzeige (je nach Seite): 4 Groesse, 5 Deckkraft, 6 Abstand, 8 Hintergrund (nur FPS)
         void KsSliderTo(int kind, int x)
         {
             double t = Math.Min(Math.Max((x - KS_SL_X) / (double)KS_SL_W, 0), 1);
-            int old;
-            if (kind == 4) { old = keysScale; keysScale = 60 + (int)Math.Round(t * 14) * 10; if (old == keysScale) return; }
-            else if (kind == 5) { old = keysOpacity; keysOpacity = 20 + (int)Math.Round(t * 16) * 5; if (old == keysOpacity) return; }
-            else { old = keysMargin; keysMargin = (int)Math.Round(t * 20) * 10; if (old == keysMargin) return; }
-            KeysChanged(true);
+            bool fps = page == 6;
+            if (kind == 8)
+            {
+                int b = (int)Math.Round(t * 20) * 5;
+                if (b == fpsBox) return;
+                fpsBox = b;
+                LayChanged(true);
+                Invalidate();
+                return;
+            }
+            int v = kind == 4 ? 60 + (int)Math.Round(t * 14) * 10 : kind == 5 ? 20 + (int)Math.Round(t * 16) * 5 : (int)Math.Round(t * 20) * 10;
+            if (kind == 4) { if ((fps ? fpsScale : keysScale) == v) return; if (fps) fpsScale = v; else keysScale = v; }
+            else if (kind == 5) { if ((fps ? fpsOpacity : keysOpacity) == v) return; if (fps) fpsOpacity = v; else keysOpacity = v; }
+            else { if ((fps ? fpsMargin : keysMargin) == v) return; if (fps) fpsMargin = v; else keysMargin = v; }
+            LayChanged(true);
             Invalidate();
+        }
+
+        // Anordnen in der Vorschau gilt fuer die Anzeige der offenen Seite (Tastenanzeige oder FPS-Anzeige)
+        RectangleF[] LayPos { get { return page == 6 ? fpsPos : keysPos; } }
+        bool[] LayShow { get { return page == 6 ? fpsShow : keysShow; } }
+        bool LaySnap { get { return page == 6 ? fpsSnap : keysSnap; } }
+        RectangleF[] LayDefault() { return page == 6 ? FpsOverlayForm.DefaultTileLayout() : KeyOverlayForm.DefaultLayout(); }
+        KeyOverlayForm LayOverlay() { return page == 6 ? (KeyOverlayForm)FpsOverlay() : KeysOverlay(); }
+        void LayChanged(bool preview) { if (page == 6) FpsChanged(preview); else KeysChanged(preview); }
+
+        // ---------------------------------------------------------- FPS-Anzeige
+        FpsOverlayForm FpsOverlay()
+        {
+            if (fpsOverlay == null || fpsOverlay.IsDisposed)
+            {
+                fpsOverlay = new FpsOverlayForm(scale);
+                fpsOverlay.Moved = delegate(Point p)
+                {
+                    fpsPlace.Corner = 4;
+                    fpsPlace.X = p.X;
+                    fpsPlace.Y = p.Y;
+                    SaveSettings();
+                    Invalidate();
+                };
+                ConfigureFps(fpsOverlay);
+                fpsOverlay.SetShown(fpsShow);
+                fpsOverlay.SetLayout(fpsPos);
+                fpsOverlay.SetValues(Perf.Now);
+            }
+            KeysLook(fpsOverlay);
+            return fpsOverlay;
+        }
+
+        void ConfigureFps(FpsOverlayForm o)
+        {
+            o.Configure(fpsScale, fpsOpacity, fpsPlace.Corner, fpsMargin, new Point(fpsPlace.X, fpsPlace.Y));
+            o.SetBox(fpsBox);
+        }
+
+        // Messen nur, solange etwas die Werte zeigt
+        bool NeedPerf()
+        {
+            return servicesStarted && !exiting &&
+                (fpsOn || FpsPlacing || (page == 6 && Visible && WindowState != FormWindowState.Minimized));
+        }
+
+        // Sichtbarkeit nachfuehren; mit "Nur im Vollbild" nur ueber Vollbild-Fenstern und auf der eigenen Seite
+        void FpsApply()
+        {
+            bool need = NeedPerf();
+            Perf.SetActive(need);
+            if (need && !perfTimer.Enabled) perfTimer.Start();
+            if (!fpsOn && (fpsOverlay == null || fpsOverlay.IsDisposed)) return;
+            try
+            {
+                FpsOverlayForm o = FpsOverlay();
+                ConfigureFps(o);
+                bool want = fpsOn && (!fpsFullOnly || (OwnForeground() ? page == 6 && Visible : fpsFgFull));
+                if (want && !o.Live) o.ShowLive();
+                else if (!want && o.Live) o.HideLive();
+            }
+            catch { }
+        }
+
+        void SetFpsOn(bool on)
+        {
+            fpsOn = on;
+            UpdateFgTimer();
+            if (on) ForegroundTick();
+            FpsApply();
+            SaveSettings();
+            Invalidate();
+        }
+
+        void ToggleFpsByHotkey()
+        {
+            SetFpsOn(!fpsOn);
+            try
+            {
+                if (overlay == null || overlay.IsDisposed) overlay = new OverlayForm(logo, scale);
+                IntPtr fg = Native.GetForegroundWindow();
+                overlay.ShowMessage("FPS-Anzeige " + (fpsOn ? "an" : "aus"), fpsKey.Short(),
+                    fg != IntPtr.Zero ? Screen.FromHandle(fg) : Screen.PrimaryScreen, 2);
+            }
+            catch { }
+        }
+
+        void FpsChanged(bool preview)
+        {
+            try
+            {
+                FpsOverlayForm o = FpsOverlay();
+                ConfigureFps(o);
+                o.SetShown(fpsShow);
+                o.SetLayout(fpsPos);
+                if (preview && !fpsOn && !o.Placing) o.ShowPreview(new KeyMon(), 1500);
+            }
+            catch { }
+        }
+
+        bool FpsPlacing { get { return fpsOverlay != null && !fpsOverlay.IsDisposed && fpsOverlay.Placing; } }
+
+        void ToggleFpsPlacing()
+        {
+            try
+            {
+                if (FpsPlacing) EndFpsPlacing();
+                else
+                {
+                    FpsOverlayForm o = FpsOverlay();
+                    ConfigureFps(o);
+                    o.StartPlacing(new KeyMon());
+                }
+            }
+            catch { }
+            Invalidate();
+        }
+
+        void EndFpsPlacing()
+        {
+            if (!FpsPlacing) return;
+            fpsOverlay.EndPlacing();
+            FpsApply();
+            Invalidate();
+        }
+
+        void FpsPreview()
+        {
+            try { FpsOverlay().ShowPreview(new KeyMon(), KeysPreviewMs); }
+            catch { }
+        }
+
+        // Fenster deckt seinen Bildschirm ganz ab (Spiel im Vollbild oder randlos); der Desktop zaehlt nicht
+        static bool CoversScreen(IntPtr hwnd, string exe)
+        {
+            Native.RECT r;
+            if (hwnd == IntPtr.Zero || exe == null || exe == "explorer.exe" || !Native.GetWindowRect(hwnd, out r)) return false;
+            Rectangle b = Screen.FromHandle(hwnd).Bounds;
+            return r.Left <= b.Left && r.Top <= b.Top && r.Right >= b.Right && r.Bottom >= b.Bottom;
+        }
+
+        // ETW-Zugriff einmalig einrichten: Benutzer in "Leistungsprotokollbenutzer" (SID, unabhaengig von der Sprache);
+        // braucht Admin (UAC-Abfrage) und gilt nach dem naechsten Anmelden
+        void GrantEtwAccess()
+        {
+            try
+            {
+                string sid = System.Security.Principal.WindowsIdentity.GetCurrent().User.Value;
+                ProcessStartInfo psi = new ProcessStartInfo("powershell.exe",
+                    "-NoProfile -WindowStyle Hidden -Command \"Add-LocalGroupMember -SID S-1-5-32-559 -Member '" + sid + "'\"");
+                psi.Verb = "runas";
+                psi.UseShellExecute = true;
+                psi.WindowStyle = ProcessWindowStyle.Hidden;
+                Process.Start(psi);
+                MessageBox.Show("Nach dem nächsten Ab- und Anmelden bei Windows kann Purple Clicker die FPS messen.", "Purple Clicker");
+            }
+            catch { }   // UAC abgelehnt
         }
 
         void ShowFromTray()
@@ -3077,8 +4147,10 @@ namespace PurpleClicker
                 e.Cancel = true;
                 if (popupOpen) popupOpen = false;
                 EndKeysPlacing();
+                EndFpsPlacing();
                 SaveSettings();
                 Hide();
+                FpsApply();   // Seite nicht mehr sichtbar: ohne FPS-Anzeige wird nicht mehr gemessen
                 return;
             }
             base.OnFormClosing(e);
@@ -3094,6 +4166,10 @@ namespace PurpleClicker
             remap.ReleaseAll();
             keyMon.Clear();
             if (keysOverlay != null && !keysOverlay.IsDisposed) keysOverlay.Close();
+            perfTimer.Stop();
+            Perf.SetActive(false);
+            FpsEtw.Stop();
+            if (fpsOverlay != null && !fpsOverlay.IsDisposed) fpsOverlay.Close();
             if (showEvent != null) { try { showEvent.Set(); } catch { } }
             if (notify != null) { notify.Visible = false; notify.Dispose(); notify = null; }
             if (mouseHook != IntPtr.Zero) Native.UnhookWindowsHookEx(mouseHook);
@@ -3227,6 +4303,16 @@ namespace PurpleClicker
                 }
                 if (!down && keysOverlay.Dragging) keysOverlay.EndDrag();
             }
+            if (btn == 1 && FpsPlacing)
+            {
+                if (down && fpsOverlay.Bounds.Contains(pt))
+                {
+                    fpsOverlay.BeginDrag(pt);
+                    swallowUp[1] = true;
+                    return true;
+                }
+                if (!down && fpsOverlay.Dragging) fpsOverlay.EndDrag();
+            }
             if (!down)
             {
                 if (swallowUp[btn]) { swallowUp[btn] = false; return true; }
@@ -3270,11 +4356,11 @@ namespace PurpleClicker
             return remap.On && remap.Button(btn, true, RemapAllowed(pt));
         }
 
-        // Welcher Hotkey passt: 0 Start/Stop, 1 Multiplikator, 2 Tastenanzeige, -1 keiner.
+        // Welcher Hotkey passt: 0 Start/Stop, 1 Multiplikator, 2 Tastenanzeige, 3 FPS-Anzeige, -1 keiner.
         // Start/Stop und Multiplikator nur, wenn der Programm-Filter passt; bei mehreren gewinnt der genauere
         int BestHotkey(bool isMouse, int code, int held)
         {
-            Hotkey[] keys = { hotkey, mulKey, keysKey };
+            Hotkey[] keys = { hotkey, mulKey, keysKey, fpsKey };
             int best = -1;
             for (int i = 0; i < keys.Length; i++)
             {
@@ -3290,10 +4376,11 @@ namespace PurpleClicker
             if ((held & (Hotkey.MAlt | Hotkey.MWin)) != 0) Native.MaskKey();
             if (which == 0) Toggle();
             else if (which == 1) ToggleMulti();
-            else ToggleKeysByHotkey();
+            else if (which == 2) ToggleKeysByHotkey();
+            else ToggleFpsByHotkey();
         }
 
-        // Belegt den gerade gewaehlten Hotkey (Start/Stop, Multiplikator oder Tastenanzeige); keine Doppelbelegung
+        // Belegt den gerade gewaehlten Hotkey (Start/Stop, Multiplikator, Tastenanzeige oder FPS-Anzeige); keine Doppelbelegung
         void AssignKey(bool isMouse, int code, int mods)
         {
             Hotkey h = new Hotkey(isMouse, code, mods);
@@ -3303,18 +4390,28 @@ namespace PurpleClicker
                 hotkey = h;
                 if (mulKey.Same(h)) mulKey = none;
                 if (keysKey.Same(h)) keysKey = new Hotkey(false, 0);
+                if (fpsKey.Same(h)) fpsKey = new Hotkey(false, 0);
             }
             else if (capTarget == 1)
             {
                 if (hotkey.Same(h)) return;
                 mulKey = h;
                 if (keysKey.Same(h)) keysKey = none;
+                if (fpsKey.Same(h)) fpsKey = new Hotkey(false, 0);
             }
-            else
+            else if (capTarget == 2)
             {
                 // Tastenanzeige: weder Start/Stop- noch Multiplikator-Hotkey ueberschreiben
                 if (hotkey.Same(h) || mulKey.Same(h)) return;
                 keysKey = h;
+                if (fpsKey.Same(h)) fpsKey = none;
+            }
+            else
+            {
+                // FPS-Anzeige: wie die Tastenanzeige; deren Hotkey wird frei
+                if (hotkey.Same(h) || mulKey.Same(h)) return;
+                fpsKey = h;
+                if (keysKey.Same(h)) keysKey = none;
             }
             SaveSettings();
         }
@@ -3368,10 +4465,11 @@ namespace PurpleClicker
                 return swallowedKeys.Remove(vk);
             }
             // Enter/Esc beenden das Verschieben, auch wenn gerade das Spiel im Vordergrund ist
-            if (KeysPlacing && (vk == (int)Keys.Return || vk == (int)Keys.Escape))
+            if ((KeysPlacing || FpsPlacing) && (vk == (int)Keys.Return || vk == (int)Keys.Escape))
             {
                 swallowedKeys.Add(vk);
                 EndKeysPlacing();
+                EndFpsPlacing();
                 return true;
             }
 
@@ -3396,6 +4494,7 @@ namespace PurpleClicker
                 if (vk != (int)Keys.Escape) AssignKey(false, vk, Hotkey.Held());
                 else if (capTarget == 1) mulKey = new Hotkey(false, 0);   // Esc entfernt den Multiplikator-Hotkey
                 else if (capTarget == 2) { keysKey = new Hotkey(false, 0); SaveSettings(); }   // bzw. den der Tastenanzeige
+                else if (capTarget == 3) { fpsKey = new Hotkey(false, 0); SaveSettings(); }    // bzw. den der FPS-Anzeige
                 Invalidate();
                 return true;
             }
@@ -3415,7 +4514,7 @@ namespace PurpleClicker
         void UpdateFgTimer()
         {
             fgTimer.Enabled = servicesStarted && !exiting &&
-                (filterOn || recording || (keysOn && (!keysGlobal || keysPrograms.Count > 0)));
+                (filterOn || recording || (keysOn && (!keysGlobal || keysPrograms.Count > 0)) || (fpsOn && fpsFullOnly));
         }
 
         void ForegroundTick()
@@ -3436,8 +4535,10 @@ namespace PurpleClicker
                 string kp = null;
                 if (exe != null) foreach (string p in keysPrograms) if (p == exe) { kp = p; break; }
                 keysFgProg = kp;
+                fpsFgFull = CoversScreen(fg, exe);
             }
             KeysApply();
+            FpsApply();
 
             if (recording && Environment.TickCount - recStart > 90000) { EndRecording(false); rmNote = "Zeit abgelaufen"; }
             bool newActive = !filterOn || own || match;
@@ -3998,13 +5099,14 @@ namespace PurpleClicker
             if (R_BattBtn.Contains(p)) return Hit.BattBtn;
             if (R_ArtyBtn.Contains(p)) return Hit.ArtyBtn;
             if (R_KeysBtn.Contains(p)) return Hit.KeysBtn;
+            if (R_FpsBtn.Contains(p)) return Hit.FpsBtn;
             if (logo != null && R_Logo.Contains(p)) return Hit.LinkHome;
             if (linkDocRect.Contains(p)) return Hit.LinkDoc;
             if (linkRepoRect.Contains(p)) return Hit.LinkRepo;
             if (R_Title.Contains(p)) return Hit.Drag;
             if (page == 1) return HitRemap(p);
             if (page == 3) return HitArty(p);
-            if (page == 4) return HitKeys(p);
+            if (page == 4 || page == 6) return HitKeys(p);
             if (page == 5) return HitSettings(p);
             if (page == 2)
             {
@@ -4050,8 +5152,8 @@ namespace PurpleClicker
 
         // Knopf der Startseiten-Auswahl fuer Seite BarPage[BarOrder[i]] (ohne Theme-Auswahl)
         static Rectangle StStartRect(int i) { return new Rectangle(664 - 30 - (StStartPages.Length - 1 - i) * 38, 133, 30, 30); }
-        static readonly int[] StStartFeat = { BAR_CLICK, 0, 1, 2, 3 };
-        static readonly int[] StStartPages = { 0, 4, 3, 2, 1 };
+        static readonly int[] StStartFeat = { BAR_CLICK, 0, BAR_FPS, 1, 2, 3 };
+        static readonly int[] StStartPages = { 0, 4, 6, 3, 2, 1 };
 
         Hit HitSettings(Point p)
         {
@@ -4150,21 +5252,37 @@ namespace PurpleClicker
             return new Rectangle(KsColX[col], KS_KEY_Y0 + row * KS_KEY_ROW, KsColW[col], KS_KEY_ROW - 1);
         }
 
+        // Schalter je Kachel der FPS-Anzeige: zwei Spalten
+        static Rectangle FsCell(int i)
+        {
+            return new Rectangle(i % 2 == 0 ? 36 : 190, KS_KEY_Y0 + (i / 2) * FS_ROW, 146, FS_ROW - 1);
+        }
+
+        // Tastenanzeige und FPS-Anzeige (page 6) teilen sich Aufbau und Treffer; nur Schalter und Leiste unten unterscheiden sich
         Hit HitKeys(Point p)
         {
-            if (popupOpen) return HitPopup(p);
+            bool fps = page == 6;
+            if (popupOpen && !fps) return HitPopup(p);
             if (R_KsSw.Contains(p)) return Hit.KsSw;
             if (R_KsHot.Contains(p)) return Hit.KsHot;
             if (R_KsPrevBtn.Contains(p)) return Hit.KsPreview;
-            if (R_KsGlobalHit.Contains(p)) return Hit.KsGlobal;
-            for (int i = 0; i < ksChipRects.Count; i++)
+            if (fps)
             {
-                Rectangle c = ksChipRects[i];
-                if (!c.Contains(p)) continue;
-                hitIndex = i;
-                return i > 0 && p.X >= c.Right - 24 ? Hit.KsProgX : Hit.KsProg;
+                if (R_FsFullHit.Contains(p)) return Hit.FsFull;
+                if (Perf.Now.EtwError == 5 && R_FsGrant.Contains(p)) return Hit.FsGrant;
             }
-            if (ksAddRect.Contains(p)) return Hit.KsProgAdd;
+            else
+            {
+                if (R_KsGlobalHit.Contains(p)) return Hit.KsGlobal;
+                for (int i = 0; i < ksChipRects.Count; i++)
+                {
+                    Rectangle c = ksChipRects[i];
+                    if (!c.Contains(p)) continue;
+                    hitIndex = i;
+                    return i > 0 && p.X >= c.Right - 24 ? Hit.KsProgX : Hit.KsProg;
+                }
+                if (ksAddRect.Contains(p)) return Hit.KsProgAdd;
+            }
             if (R_KsScreen.Contains(p))
             {
                 hitIndex = (p.X >= R_KsScreen.X + R_KsScreen.Width / 2 ? 1 : 0) + (p.Y >= R_KsScreen.Y + R_KsScreen.Height / 2 ? 2 : 0);
@@ -4178,11 +5296,19 @@ namespace PurpleClicker
             }
             if (R_KsReset.Contains(p)) return Hit.KsReset;
             if (R_KsSnapHit.Contains(p)) return Hit.KsSnap;
-            for (int i = 0; i < KsKeyCol.Length; i++)
-                if (KsKeyCell(i).Contains(p)) { hitIndex = i; return Hit.KsKey; }
-            Hit[] sl = { Hit.KsScale, Hit.KsOpacity, Hit.KsMargin };
+            if (fps)
+            {
+                for (int i = 0; i < FsNames.Length; i++)
+                    if (FsCell(i).Contains(p)) { hitIndex = i; return Hit.KsKey; }
+            }
+            else
+                for (int i = 0; i < KsKeyCol.Length; i++)
+                    if (KsKeyCell(i).Contains(p)) { hitIndex = i; return Hit.KsKey; }
+            Hit[] sl = fps ? new Hit[] { Hit.KsScale, Hit.KsOpacity, Hit.FsBox, Hit.KsMargin } : new Hit[] { Hit.KsScale, Hit.KsOpacity, Hit.KsMargin };
+            int[] rows = fps ? FsRowY : KsRowY;
+            int off = fps ? FS_SL_OFF : KS_SL_OFF;
             for (int i = 0; i < sl.Length; i++)
-                if (new Rectangle(KS_COL_X, KsRowY[i] + 22, 664 - KS_COL_X, 24).Contains(p)) return sl[i];
+                if (new Rectangle(KS_COL_X, rows[i] + off - 12, 664 - KS_COL_X, 24).Contains(p)) return sl[i];
             return Hit.None;
         }
 
@@ -4294,6 +5420,7 @@ namespace PurpleClicker
                         BuildFonts();
                         rainbowTimer.Enabled = theme == THEME_RAINBOW;
                         if (keysOverlay != null && !keysOverlay.IsDisposed) KeysLook(keysOverlay);
+                        if (fpsOverlay != null && !fpsOverlay.IsDisposed) KeysLook(fpsOverlay);
                         SaveSettings();
                     }
                     break;
@@ -4308,8 +5435,21 @@ namespace PurpleClicker
                     themeOpen = false;
                     break;
                 case Hit.StStart:
-                    if (idx >= 0 && idx <= 4) { startPage = idx; SaveSettings(); }
+                    if (Array.IndexOf(StStartPages, idx) >= 0) { startPage = idx; SaveSettings(); }
                     break;
+                case Hit.FpsBtn:
+                    EndRecording(false);
+                    page = page == 6 ? HomePage() : 6;
+                    popupOpen = false;
+                    themeOpen = false;
+                    break;
+                case Hit.FsFull:
+                    fpsFullOnly = !fpsFullOnly;
+                    UpdateFgTimer();
+                    ForegroundTick();
+                    SaveSettings();
+                    break;
+                case Hit.FsGrant: GrantEtwAccess(); break;
                 case Hit.MouseBtn:
                     EndRecording(false);
                     page = page == 1 ? HomePage() : 1;
@@ -4363,11 +5503,18 @@ namespace PurpleClicker
                         popupOpen = true;
                     }
                     break;
-                case Hit.KsSw: SetKeysOn(!keysOn); break;
-                case Hit.KsCorner:
-                    if (idx >= 0 && idx <= 3) { PlaceOf(keysEdit).Corner = idx; KeysChanged(true); SaveSettings(); }
+                case Hit.KsSw:
+                    if (page == 6) SetFpsOn(!fpsOn); else SetKeysOn(!keysOn);
                     break;
-                case Hit.KsHot: capTarget = 2; capturing = !capturing; break;
+                case Hit.KsCorner:
+                    if (idx >= 0 && idx <= 3)
+                    {
+                        if (page == 6) fpsPlace.Corner = idx; else PlaceOf(keysEdit).Corner = idx;
+                        LayChanged(true);
+                        SaveSettings();
+                    }
+                    break;
+                case Hit.KsHot: capTarget = page == 6 ? 3 : 2; capturing = !capturing; break;
                 case Hit.KsGlobal:
                     keysGlobal = !keysGlobal;
                     UpdateFgTimer();
@@ -4398,38 +5545,46 @@ namespace PurpleClicker
                     popTarget = 1;
                     popupOpen = true;
                     break;
-                case Hit.KsMove: ToggleKeysPlacing(); break;
+                case Hit.KsMove:
+                    if (page == 6) ToggleFpsPlacing(); else ToggleKeysPlacing();
+                    break;
                 case Hit.KsCap:
                     if (idx >= 0)
                     {
                         dragKind = 7;
                         ksDragCap = idx;
                         ksDragEdge = ksHitEdge;
-                        ksDragStart = keysPos[idx];
+                        ksDragStart = LayPos[idx];
                         ksDragP0 = p;
                     }
                     break;
-                case Hit.KsSnap: keysSnap = !keysSnap; SaveSettings(); break;
+                case Hit.KsSnap:
+                    if (page == 6) fpsSnap = !fpsSnap; else keysSnap = !keysSnap;
+                    SaveSettings();
+                    break;
                 case Hit.KsReset:
-                    keysPos = KeyOverlayForm.DefaultLayout();
-                    KeysChanged(true);
+                    if (page == 6) fpsPos = FpsOverlayForm.DefaultTileLayout(); else keysPos = KeyOverlayForm.DefaultLayout();
+                    LayChanged(true);
                     SaveSettings();
                     break;
                 case Hit.KsKey:
-                    if (idx >= 0 && idx < keysShow.Length)
+                    if (idx >= 0 && idx < LayShow.Length)
                     {
-                        keysShow[idx] = !keysShow[idx];
-                        KeysChanged(true);
+                        LayShow[idx] = !LayShow[idx];
+                        LayChanged(true);
                         SaveSettings();
                     }
                     break;
                 case Hit.KsScale:
                 case Hit.KsOpacity:
                 case Hit.KsMargin:
-                    dragKind = h == Hit.KsScale ? 4 : h == Hit.KsOpacity ? 5 : 6;
+                case Hit.FsBox:
+                    dragKind = h == Hit.KsScale ? 4 : h == Hit.KsOpacity ? 5 : h == Hit.FsBox ? 8 : 6;
                     KsSliderTo(dragKind, p.X);
                     break;
-                case Hit.KsPreview: KeysPreview(); break;
+                case Hit.KsPreview:
+                    if (page == 6) FpsPreview(); else KeysPreview();
+                    break;
                 case Hit.ArPos: ArFocus(0); break;
                 case Hit.ArTgt: ArFocus(1); break;
                 case Hit.ArTabField: ArFocus(2); break;
@@ -4578,7 +5733,9 @@ namespace PurpleClicker
                 case Hit.PopOutside: popupOpen = false; arTabOpen = false; break;
             }
             if (page != 4 || h == Hit.Min) EndKeysPlacing();
+            if (page != 6 || h == Hit.Min) EndFpsPlacing();
             KeysApply();   // Seitenwechsel: ohne "Ueberall" ist die Anzeige auf ihrer eigenen Seite sichtbar
+            FpsApply();    // FPS-Seite offen: messen (Vorschau), sonst nur bei eingeschalteter Anzeige
             hover = HitTest(p);
             hoverIdx = hitIndex;
             Invalidate();
@@ -4654,6 +5811,19 @@ namespace PurpleClicker
             EndRecording(false);   // sonst wuerde die Aufnahme global Tasten schlucken
         }
 
+        // Aus dem Tray geholt oder wiederhergestellt, waehrend die FPS-Seite offen ist: sofort messen (Vorschau)
+        protected override void OnVisibleChanged(EventArgs e)
+        {
+            base.OnVisibleChanged(e);
+            if (servicesStarted && !exiting) FpsApply();
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            if (servicesStarted && !exiting && page == 6) FpsApply();
+        }
+
         // Tab soll auf der Artillerie-Seite in OnKeyDown ankommen (Wechsel Position <-> Ziel)
         protected override bool ProcessDialogKey(Keys keyData)
         {
@@ -4685,8 +5855,9 @@ namespace PurpleClicker
                 e.Handled = true;
                 return;
             }
-            if ((page == 1 || page == 2 || ((page == 4 || page == 5) && !popupOpen)) && !themeOpen && e.KeyCode == Keys.Escape)
+            if ((page == 1 || page == 2 || ((page == 4 || page == 5 || page == 6) && !popupOpen)) && !themeOpen && e.KeyCode == Keys.Escape)
             {
+                EndFpsPlacing();
                 page = HomePage();
                 Invalidate();
                 e.Handled = true;
@@ -5064,6 +6235,7 @@ namespace PurpleClicker
             DrawSettingsIcon(g, hover == Hit.SettingsBtn);
             DrawFeatIcon(g, BAR_CLICK, R_ClickBtn, hover == Hit.ClickBtn, page == 0);
             DrawFeatIcon(g, 0, R_KeysBtn, hover == Hit.KeysBtn, page == 4);
+            DrawFeatIcon(g, BAR_FPS, R_FpsBtn, hover == Hit.FpsBtn, page == 6);
             DrawFeatIcon(g, 1, R_ArtyBtn, hover == Hit.ArtyBtn, page == 3);
             DrawFeatIcon(g, 2, R_BattBtn, hover == Hit.BattBtn, page == 2);
             DrawFeatIcon(g, 3, R_MouseBtn, hover == Hit.MouseBtn, page == 1);
@@ -5071,7 +6243,7 @@ namespace PurpleClicker
             {
                 if (page == 1) DrawRemapPage(g);
                 else if (page == 2) DrawBatteryPage(g);
-                else if (page == 4) DrawKeysPage(g);
+                else if (page == 4 || page == 6) DrawKeysPage(g);
                 else if (page == 5) DrawSettingsPage(g);
                 else
                 {
@@ -5230,7 +6402,30 @@ namespace PurpleClicker
             else if (f == 2) DrawBattIcon(g, r, hot, sel);
             else if (f == 3) DrawMouseIcon(g, r, hot, sel);
             else if (f == BAR_CLICK) DrawClickIcon(g, r, hot, sel);
+            else if (f == BAR_FPS) DrawFpsIcon(g, r, hot, sel);
             else DrawThemeIcon(g, r, hot || sel);
+        }
+
+        // Tacho (oeffnet die FPS-Anzeige); Punkt oben rechts, wenn sie an ist
+        void DrawFpsIcon(Graphics g, Rectangle r, bool hot, bool sel)
+        {
+            BtnShape(g, hot || sel ? C_BtnHover : C_Btn, r);
+            float cx = r.X + r.Width / 2f, cy = r.Y + r.Height / 2f + 3.5f;
+            Color c = sel ? C_Accent : C_Text;
+            using (Pen pen = new Pen(c, 1.6f))
+            {
+                pen.StartCap = LineCap.Round;
+                pen.EndCap = LineCap.Round;
+                g.DrawArc(pen, cx - 9f, cy - 9f, 18f, 18f, 180f, 180f);
+                g.DrawLine(pen, cx - 9f, cy + 1.5f, cx - 9f, cy);
+                g.DrawLine(pen, cx + 9f, cy + 1.5f, cx + 9f, cy);
+                g.DrawLine(pen, cx, cy, cx + 4.6f, cy - 5.6f);   // Zeiger
+            }
+            using (SolidBrush b = new SolidBrush(c))
+                g.FillEllipse(b, cx - 2f, cy - 2f, 4f, 4f);
+            if (fpsOn)
+                using (SolidBrush b = new SolidBrush(C_Accent))
+                    g.FillEllipse(b, r.Right - 8, r.Y + 3, 5, 5);
         }
 
         // Autoclicker: Mauszeiger mit Klick-Strahlen
@@ -5423,17 +6618,20 @@ namespace PurpleClicker
             if (popupOpen) DrawPopup(g);
         }
 
-        // Tastenanzeige-Seite: Schalter, Vorschau mit Beispielzustand, Tasten-Schalter, Ecke und Schieber
+        // Tastenanzeige-Seite: Schalter, Vorschau mit Beispielzustand, Tasten-Schalter, Ecke und Schieber.
+        // Die FPS-Seite (page 6) hat denselben Aufbau: Kacheln statt Tasten, unten Vollbild-Schalter und Sensoren
         void DrawKeysPage(Graphics g)
         {
-            Card(g, R_KsCard, "TASTENANZEIGE");
-            DrawText(g, "Tastenanzeige einblenden", fBtn, C_Text, new Rectangle(40, R_KsSw.Y, R_KsPrevBtn.X - 50, R_KsSw.Height), StringAlignment.Near);
-            Switch(g, R_KsSw, keysOn, hover == Hit.KsSw);
+            bool fps = page == 6;
+            Card(g, R_KsCard, fps ? "FPS-ANZEIGE" : "TASTENANZEIGE");
+            DrawText(g, fps ? "FPS-Anzeige einblenden" : "Tastenanzeige einblenden", fBtn, C_Text, new Rectangle(40, R_KsSw.Y, R_KsPrevBtn.X - 50, R_KsSw.Height), StringAlignment.Near);
+            Switch(g, R_KsSw, fps ? fpsOn : keysOn, hover == Hit.KsSw);
             float pbr = RadCtl(R_KsPrevBtn.Height);
             FillRR(g, hover == Hit.KsPreview ? C_BtnHover : C_Btn, R_KsPrevBtn, pbr);
             DrawText(g, "Vorschau", fChip, C_Text, R_KsPrevBtn, StringAlignment.Center);
             // Hotkey-Feld: Klick, dann Taste oder Maustaste druecken (Esc entfernt)
-            bool capKs = capturing && capTarget == 2;
+            bool capKs = capturing && capTarget == (fps ? 3 : 2);
+            Hotkey hk = fps ? fpsKey : keysKey;
             float hr = RadCtl(R_KsHot.Height);
             FillRR(g, C_Field, R_KsHot, hr);
             StrokeRR(g, capKs ? C_Accent : hover == Hit.KsHot ? C_Dim : C_CardLine, R_KsHot, hr, capKs ? 1.5f : 1f);
@@ -5443,7 +6641,7 @@ namespace PurpleClicker
             {
                 Rectangle inner = new Rectangle(R_KsHot.X + 12, R_KsHot.Y, R_KsHot.Width - 24, R_KsHot.Height);
                 DrawText(g, "Hotkey", fChip, C_Dim, inner, StringAlignment.Near);
-                DrawText(g, keysKey.Code == 0 ? "–" : keysKey.Short(), fChip, keysKey.Code == 0 ? C_Dim : C_Text, inner, StringAlignment.Far);
+                DrawText(g, hk.Code == 0 ? "–" : hk.Short(), fChip, hk.Code == 0 ? C_Dim : C_Text, inner, StringAlignment.Far);
             }
             using (Pen sep = new Pen(C_CardLine, 1f))
             {
@@ -5463,8 +6661,9 @@ namespace PurpleClicker
                     for (int x = R_KsPrev.X - R_KsPrev.Height; x < R_KsPrev.Right; x += 14)
                         g.DrawLine(hz, x, R_KsPrev.Bottom, x + R_KsPrev.Height, R_KsPrev.Y);
                 g.TranslateTransform(R_KsPrev.X, R_KsPrev.Y);
-                KeyOverlayForm ko = KeysOverlay();
-                ko.Draw(g, KeyOverlayForm.Demo(KeyOverlayForm.DefaultCaps, KeysDemo, 60000), 1f, keysOpacity / 100f, false);
+                KeyOverlayForm ko = LayOverlay();
+                // FPS-Anzeige mit den echten Messwerten (die Seite wird dafuer alle 500 ms neu gezeichnet)
+                ko.Draw(g, fps ? null : KeyOverlayForm.Demo(KeyOverlayForm.DefaultCaps, KeysDemo, 60000), 1f, (fps ? fpsOpacity : keysOpacity) / 100f, false);
                 // eingerastete X/Y-Achsen beim Anordnen
                 if (ksDragCap >= 0 && (ksGuideX.Count > 0 || ksGuideY.Count > 0))
                     using (Pen gp = new Pen(A(220, C_Accent), 1f))
@@ -5492,29 +6691,32 @@ namespace PurpleClicker
             }
             StrokeRR(g, C_CardLine, R_KsPrev, pr, 1f);
 
-            Switch(g, R_KsSnapSw, keysSnap, hover == Hit.KsSnap);
+            Switch(g, R_KsSnapSw, LaySnap, hover == Hit.KsSnap);
             DrawText(g, "Einrasten", fBtn, C_Text, new Rectangle(R_KsSnapSw.Right + 10, R_KsSnapSw.Y, 100, R_KsSnapSw.Height), StringAlignment.Near);
             bool def = KsLayoutIsDefault();
             float rr = RadCtl(R_KsReset.Height);
             FillRR(g, hover == Hit.KsReset && !def ? C_BtnHover : C_Btn, R_KsReset, rr);
             DrawText(g, "Zurücksetzen", fChip, def ? C_Dim : C_Text, R_KsReset, StringAlignment.Center);
 
-            // Welche Tasten angezeigt werden
-            for (int i = 0; i < KsKeyCol.Length; i++)
+            // Welche Tasten bzw. Kacheln angezeigt werden
+            int cells = fps ? FsNames.Length : KsKeyCol.Length;
+            for (int i = 0; i < cells; i++)
             {
-                Rectangle cell = KsKeyCell(i);
-                bool on = keysShow[i], hot = hover == Hit.KsKey && hoverIdx == i;
+                Rectangle cell = fps ? FsCell(i) : KsKeyCell(i);
+                bool on = LayShow[i], hot = hover == Hit.KsKey && hoverIdx == i;
                 Switch(g, new Rectangle(cell.X, cell.Y + (cell.Height - 16) / 2, 28, 16), on, hot);
-                DrawText(g, KsKeyNames[i], fChip, on || hot ? C_Text : C_Dim,
+                DrawText(g, fps ? FsNames[i] : KsKeyNames[i], fChip, on || hot ? C_Text : C_Dim,
                     new Rectangle(cell.X + 36, cell.Y, cell.Width - 40, cell.Height), StringAlignment.Near);
             }
+            if (fps) DrawFpsStatus(g);
 
             // Position: Mini-Bildschirm, jede Ecke anklickbar
-            // Position der im Chip unten gewaehlten Einstellung (Standard oder Programm)
-            KeysPlace kp = PlaceOf(keysEdit);
+            // Position der im Chip unten gewaehlten Einstellung (Standard oder Programm); die FPS-Anzeige hat nur eine
+            KeysPlace kp = fps ? fpsPlace : PlaceOf(keysEdit);
             DrawText(g, "Position", fBtn, C_Text, new Rectangle(KS_COL_X, R_KsScreen.Y, 70, R_KsScreen.Height), StringAlignment.Near);
-            DrawText(g, keysEdit ?? "Standard", fChip, keysEdit != null ? C_Accent : C_Dim,
-                new Rectangle(KS_COL_X + 72, R_KsScreen.Y, R_KsScreen.X - KS_COL_X - 80, R_KsScreen.Height), StringAlignment.Near);
+            if (!fps)
+                DrawText(g, keysEdit ?? "Standard", fChip, keysEdit != null ? C_Accent : C_Dim,
+                    new Rectangle(KS_COL_X + 72, R_KsScreen.Y, R_KsScreen.X - KS_COL_X - 80, R_KsScreen.Height), StringAlignment.Near);
             FillRR(g, C_Field, R_KsScreen, 4);
             StrokeRR(g, hover == Hit.KsCorner ? C_Dim : C_CardLine, R_KsScreen, 4, 1f);
             for (int i = 0; i < 4; i++)
@@ -5529,14 +6731,15 @@ namespace PurpleClicker
             {
                 // freie Position maßstäblich auf dem Hauptbildschirm (anderer Bildschirm: an den Rand gedrückt)
                 Rectangle pb = Screen.PrimaryScreen.Bounds;
-                double fx = Math.Min(Math.Max((kp.X - pb.Left) / (double)Math.Max(1, pb.Width - KeyOverlayForm.W * scale * keysScale / 100.0), 0), 1);
-                double fy = Math.Min(Math.Max((kp.Y - pb.Top) / (double)Math.Max(1, pb.Height - KeyOverlayForm.H * scale * keysScale / 100.0), 0), 1);
+                int ksc = fps ? fpsScale : keysScale;
+                double fx = Math.Min(Math.Max((kp.X - pb.Left) / (double)Math.Max(1, pb.Width - KeyOverlayForm.W * scale * ksc / 100.0), 0), 1);
+                double fy = Math.Min(Math.Max((kp.Y - pb.Top) / (double)Math.Max(1, pb.Height - KeyOverlayForm.H * scale * ksc / 100.0), 0), 1);
                 Rectangle q = new Rectangle(R_KsScreen.X + 5 + (int)Math.Round(fx * (R_KsScreen.Width - 32)),
                                             R_KsScreen.Y + 5 + (int)Math.Round(fy * (R_KsScreen.Height - 22)), 22, 12);
                 FillAccent(g, q, 2.5f, false);
             }
 
-            bool placing = KeysPlacing;
+            bool placing = fps ? FpsPlacing : KeysPlacing;
             float mr = RadCtl(R_KsMove.Height);
             if (placing)
             {
@@ -5551,23 +6754,65 @@ namespace PurpleClicker
                 DrawText(g, "Frei verschieben", fBtn, C_Text, R_KsMove, StringAlignment.Center);
             }
 
-            string[] names = { "Größe", "Deckkraft", "Abstand zum Rand" };
-            string[] vals = { keysScale + " %", keysOpacity + " %", keysMargin + " px" };
-            double[] ts = { (keysScale - 60) / 140.0, (keysOpacity - 20) / 80.0, keysMargin / 200.0 };
-            for (int i = 0; i < 3; i++)
+            int vs = fps ? fpsScale : keysScale, vo = fps ? fpsOpacity : keysOpacity, vm = fps ? fpsMargin : keysMargin;
+            string[] names = fps ? new string[] { "Größe", "Deckkraft", "Hintergrund", "Abstand zum Rand" }
+                                 : new string[] { "Größe", "Deckkraft", "Abstand zum Rand" };
+            string[] vals = fps ? new string[] { vs + " %", vo + " %", fpsBox == 0 ? "aus" : fpsBox + " %", vm + " px" }
+                                : new string[] { vs + " %", vo + " %", vm + " px" };
+            double[] ts = fps ? new double[] { (vs - 60) / 140.0, (vo - 20) / 80.0, fpsBox / 100.0, vm / 200.0 }
+                              : new double[] { (vs - 60) / 140.0, (vo - 20) / 80.0, vm / 200.0 };
+            int[] rows = fps ? FsRowY : KsRowY;
+            for (int i = 0; i < names.Length; i++)
             {
-                int y = KsRowY[i];
+                int y = rows[i];
                 DrawText(g, names[i], fBtn, C_Text, new Rectangle(KS_COL_X, y, 200, 20), StringAlignment.Near);
                 DrawText(g, vals[i], fBtn, C_Accent, new Rectangle(584, y, 80, 20), StringAlignment.Far);
-                int sy = y + 34;
+                int sy = y + (fps ? FS_SL_OFF : KS_SL_OFF);
                 int tx = KS_SL_X + (int)Math.Round(ts[i] * KS_SL_W);
                 FillRR(g, Color.FromArgb(34, 34, 34), new Rectangle(KS_SL_X, sy - 3, KS_SL_W, 6), 3);
                 FillAccent(g, new Rectangle(KS_SL_X, sy - 3, Math.Max(tx - KS_SL_X, 6), 6), 3, false);
                 Thumb(g, Color.White, C_Accent, tx, sy, 16, 2f);
             }
 
+            if (fps) { DrawFpsBar(g); return; }
             DrawKeysPrograms(g);
             if (popupOpen) DrawPopup(g);
+        }
+
+        // Unter den Schaltern: welches Programm gemessen wird, bzw. warum keine FPS kommen
+        void DrawFpsStatus(Graphics g)
+        {
+            PerfSnap s = Perf.Now;
+            if (s.EtwError == 5)
+            {
+                DrawText(g, "Kein Zugriff auf FPS-Daten", fChip, Color.FromArgb(230, 120, 120),
+                    new Rectangle(R_FsStatus.X, R_FsStatus.Y, R_FsGrant.X - R_FsStatus.X - 6, R_FsStatus.Height), StringAlignment.Near);
+                float gr = RadCtl(R_FsGrant.Height);
+                FillRR(g, hover == Hit.FsGrant ? A(60, C_Accent) : A(30, C_Accent), R_FsGrant, gr);
+                StrokeRR(g, C_Accent, R_FsGrant, gr, 1f);
+                DrawText(g, "Zugriff einrichten", fChip, C_Accent, R_FsGrant, StringAlignment.Center);
+                return;
+            }
+            string t;
+            if (s.EtwError != 0) t = "FPS-Messung nicht möglich (Fehler " + s.EtwError + ")";
+            else if (s.Proc.Length == 0) t = "Misst das Programm im Vordergrund";
+            else t = "Misst: " + s.Proc + (s.Api.Length > 0 ? "  ·  " + s.Api : s.Fps < 0 ? "  ·  noch kein Bild" : "");
+            DrawText(g, t, fChip, C_Dim, R_FsStatus, StringAlignment.Near);
+        }
+
+        // Leiste unten der FPS-Seite: "Nur im Vollbild" und welche GPU bzw. welcher Sensor benutzt wird
+        void DrawFpsBar(Graphics g)
+        {
+            FillCard(g, R_KsProgBar);
+            StrokeRR(g, C_CardLine, R_KsProgBar, radCard, 1f);
+            Switch(g, R_KsGlobalSw, fpsFullOnly, hover == Hit.FsFull);
+            DrawText(g, "Nur im Vollbild", fBtn, C_Text, new Rectangle(R_KsGlobalSw.Right + 10, R_KsGlobalSw.Y, 130, R_KsGlobalSw.Height), StringAlignment.Near);
+            using (Pen sep = new Pen(C_CardLine, 1f))
+                g.DrawLine(sep, FS_INFO_X - 12, R_KsProgBar.Y + 9, FS_INFO_X - 12, R_KsProgBar.Bottom - 9);
+            PerfSnap s = Perf.Now;
+            string info = !s.Ready ? "Sensoren werden gesucht…"
+                : s.Gpu + " (" + s.GpuSrc + ")  ·  CPU-Temp: " + (s.CpuTempSrc.Length > 0 ? s.CpuTempSrc : "kein Sensor");
+            DrawText(g, info, fChip, C_Dim, new Rectangle(FS_INFO_X, R_KsProgBar.Y, R_KsProgBar.Right - 14 - FS_INFO_X, R_KsProgBar.Height), StringAlignment.Near);
         }
 
         // Leiste unten: "Ueberall" und die Programme; der gewaehlte Chip bestimmt, wessen Position oben eingestellt wird
@@ -6216,12 +7461,13 @@ namespace PurpleClicker
                         case "KeysOn": keysOn = v != 0; break;
                         case "KeysCorner": keysStd.Corner = v >= 0 && v <= 4 ? v : 1; break;
                         case "KeysGlobal": keysGlobal = v != 0; break;
-                        case "StartPage": startPage = v >= 0 && v <= 4 ? v : 0; break;
+                        case "StartPage": startPage = Array.IndexOf(StStartPages, v) >= 0 ? v : 0; break;
                         case "BarKeys":
                         case "BarArty":
                         case "BarBatt":
                         case "BarMouse":
                         case "BarTheme":
+                        case "BarFps":
                         case "BarClick":   // "1;prog.exe;prog2.exe": Symbol an/aus, dann "nur wenn laeuft"
                         {
                             int bf = Array.IndexOf(BarKeys, k);
@@ -6265,6 +7511,21 @@ namespace PurpleClicker
                         case "KeysMargin": keysMargin = Math.Min(Math.Max(v, 0), 200); break;
                         case "KeysScale": keysScale = Math.Min(Math.Max(v, 60), 200); break;
                         case "KeysOpacity": keysOpacity = Math.Min(Math.Max(v, 20), 100); break;
+                        case "FpsOn": fpsOn = v != 0; break;
+                        case "FpsCorner": fpsPlace.Corner = v >= 0 && v <= 4 ? v : 0; break;
+                        case "FpsX": fpsPlace.X = v; break;
+                        case "FpsY": fpsPlace.Y = v; break;
+                        case "FpsHotMouse": fpsKey.IsMouse = v != 0; break;
+                        case "FpsHotCode": fpsKey.Code = v; break;
+                        case "FpsHotMods": fpsKey.Mods = v & 15; break;
+                        case "FpsHide": fpsShow = KeyOverlayForm.ShowFromHidden(FpsOverlayForm.Tiles, raw); break;
+                        case "FpsLayout": fpsPos = KeyOverlayForm.ParseLayout(FpsOverlayForm.Tiles, raw); break;
+                        case "FpsSnap": fpsSnap = v != 0; break;
+                        case "FpsFullOnly": fpsFullOnly = v != 0; break;
+                        case "FpsMargin": fpsMargin = Math.Min(Math.Max(v, 0), 200); break;
+                        case "FpsScale": fpsScale = Math.Min(Math.Max(v, 60), 200); break;
+                        case "FpsOpacity": fpsOpacity = Math.Min(Math.Max(v, 20), 100); break;
+                        case "FpsBox": fpsBox = Math.Min(Math.Max(v, 0), 100); break;
                         case "Theme": theme = ThemeFromSetting(raw); break;
                         case "ArtyPos":
                         case "ArtyTarget":
@@ -6316,6 +7577,9 @@ namespace PurpleClicker
                 if ((keysKey.IsMouse && (keysKey.Code < 1 || keysKey.Code > 5)) || keysKey.Code < 0 ||
                     keysKey.Same(hotkey) || keysKey.Same(mulKey))
                     keysKey = new Hotkey(false, 0);
+                if ((fpsKey.IsMouse && (fpsKey.Code < 1 || fpsKey.Code > 5)) || fpsKey.Code < 0 ||
+                    fpsKey.Same(hotkey) || fpsKey.Same(mulKey) || fpsKey.Same(keysKey))
+                    fpsKey = new Hotkey(false, 0);
             }
             catch { }
         }
@@ -6371,6 +7635,21 @@ namespace PurpleClicker
                     "KeysMargin=" + keysMargin,
                     "KeysScale=" + keysScale,
                     "KeysOpacity=" + keysOpacity,
+                    "FpsOn=" + (fpsOn ? 1 : 0),
+                    "FpsCorner=" + fpsPlace.Corner,
+                    "FpsX=" + fpsPlace.X,
+                    "FpsY=" + fpsPlace.Y,
+                    "FpsHotMouse=" + (fpsKey.IsMouse ? 1 : 0),
+                    "FpsHotCode=" + fpsKey.Code,
+                    "FpsHotMods=" + fpsKey.Mods,
+                    "FpsHide=" + KeyOverlayForm.HiddenIds(FpsOverlayForm.Tiles, fpsShow),
+                    "FpsLayout=" + KeyOverlayForm.LayoutString(FpsOverlayForm.Tiles, fpsPos),
+                    "FpsSnap=" + (fpsSnap ? 1 : 0),
+                    "FpsFullOnly=" + (fpsFullOnly ? 1 : 0),
+                    "FpsMargin=" + fpsMargin,
+                    "FpsScale=" + fpsScale,
+                    "FpsOpacity=" + fpsOpacity,
+                    "FpsBox=" + fpsBox,
                     "Theme=" + ThemeNames[theme],
                     BarKeys[0] + "=" + BarLine(0),
                     BarKeys[1] + "=" + BarLine(1),
@@ -6378,6 +7657,7 @@ namespace PurpleClicker
                     BarKeys[3] + "=" + BarLine(3),
                     BarKeys[4] + "=" + BarLine(4),
                     BarKeys[5] + "=" + BarLine(5),
+                    BarKeys[6] + "=" + BarLine(6),
                     "StartPage=" + startPage,
                     "Programs=" + string.Join(";", programs.ToArray()),
                     "ArtyPos=" + (double.IsNaN(arX[0]) ? "" : Arty.Num4(arX[0]) + " " + Arty.Num4(arY[0])),
@@ -6439,6 +7719,7 @@ namespace PurpleClicker
                 arTable.Add(new int[] { 300, 1250 });
                 arTable.Add(new int[] { 450, 1080 });
                 arTable.Add(new int[] { 600, 850 });
+                Perf.Now = FpsOverlayForm.Demo();   // FPS-Seite: erfundene Messwerte
                 if (page == 3 && snapRec == 1) { arTabOpen = true; arFocus = 2; arText[2] = "471 "; }
                 if (page == 3 && snapRec == 2) { arFocus = 1; arText[1] = "x79.4, y71"; }
             }
@@ -6512,6 +7793,60 @@ namespace PurpleClicker
                     kf.SetShown(KeyOverlayForm.ShowFromHidden(KeyOverlayForm.DefaultCaps, hide));
                     kf.SetLayout(KeyOverlayForm.ParseLayout(layout));
                     kf.Snapshot(args[i + 1], KeyOverlayForm.Demo(KeyOverlayForm.DefaultCaps, ids, 60000), placing);
+                    return;
+                }
+                // --fps-snapshot <datei.png> [--hide GPU,CpuTemp] [--layout "FPS 8 8 92 60"] [--theme N] [--scale 100] [--placing]
+                if (args[i] == "--fps-snapshot" && i + 1 < args.Length)
+                {
+                    Native.SetProcessDPIAware();
+                    float sc;
+                    using (Graphics g0 = Graphics.FromHwnd(IntPtr.Zero)) sc = g0.DpiX / 96f;
+                    string hide = FpsOverlayForm.DefaultHidden, layout = "";
+                    int th = 0, fsc = 100, box = 65;
+                    bool placing = false;
+                    for (int j = i + 2; j < args.Length; j++)
+                    {
+                        if (args[j] == "--placing") { placing = true; continue; }
+                        if (j + 1 >= args.Length) break;
+                        if (args[j] == "--hide") hide = args[++j];
+                        else if (args[j] == "--box") int.TryParse(args[++j], out box);
+                        else if (args[j] == "--layout") layout = args[++j];
+                        else if (args[j] == "--theme") int.TryParse(args[++j], out th);
+                        else if (args[j] == "--scale") int.TryParse(args[++j], out fsc);
+                    }
+                    MainForm.ApplyTheme(th);
+                    FpsOverlayForm ff = new FpsOverlayForm(sc);
+                    MainForm.KeysLook(ff);
+                    ff.Configure(Math.Min(Math.Max(fsc, 60), 200), 100, 0, 20, Point.Empty);
+                    ff.SetShown(KeyOverlayForm.ShowFromHidden(FpsOverlayForm.Tiles, hide));
+                    ff.SetLayout(KeyOverlayForm.ParseLayout(FpsOverlayForm.Tiles, layout));
+                    ff.SetBox(Math.Min(Math.Max(box, 0), 100));
+                    ff.SetValues(FpsOverlayForm.Demo());
+                    ff.Snapshot(args[i + 1], null, placing);
+                    return;
+                }
+                // --perf-log <datei.txt> [--sec 10] [--windows-gpu]: Messwerte jede Sekunde in eine Datei (Test der Sensoren)
+                if (args[i] == "--perf-log" && i + 1 < args.Length)
+                {
+                    int sec = 10;
+                    for (int j = i + 2; j < args.Length; j++)
+                    {
+                        if (args[j] == "--windows-gpu") GpuMon.ForceWindows = true;
+                        else if (args[j] == "--sec" && j + 1 < args.Length) int.TryParse(args[++j], out sec);
+                    }
+                    List<string> lines = new List<string>();
+                    Perf.SetActive(true);
+                    for (int t = 0; t < sec; t++)
+                    {
+                        Thread.Sleep(1000);
+                        PerfSnap s = Perf.Now;
+                        lines.Add(string.Format(CultureInfo.InvariantCulture,
+                            "{0}s fps={1:0.0} ({2} {3}) gpu={4:0}% {5:0}C [{6}, {7}] cpu={8:0}% {9:0}C [{10}] etw={11}",
+                            t + 1, s.Fps, s.Proc, s.Api, s.GpuLoad, s.GpuTemp, s.Gpu, s.GpuSrc, s.CpuLoad, s.CpuTemp, s.CpuTempSrc, s.EtwError));
+                    }
+                    Perf.SetActive(false);
+                    FpsEtw.Stop();
+                    File.WriteAllLines(args[i + 1], lines.ToArray());
                     return;
                 }
                 if (args[i] == "--tray") tray = true;
